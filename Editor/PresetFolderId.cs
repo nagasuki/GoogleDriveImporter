@@ -57,6 +57,12 @@ namespace GoogleDriveImporter
 
         [HideInInspector]
         public string Md5Checksum;
+
+        [HideInInspector]
+        public long LocalLastWriteTimeUtcTicks;
+
+        [HideInInspector]
+        public string LocalMd5Checksum;
     }
 
     [CreateAssetMenu(

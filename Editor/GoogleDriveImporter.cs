@@ -480,6 +480,7 @@ namespace GoogleDriveImporter
             if (!IsCacheForFolder(cache, folder))
                 cache = null;
             scan.ImportedFingerprint = cache == null ? string.Empty : cache.ImportedFingerprint;
+            ApplyCachedLocalMetadata(scan, cache);
             scan.IsChanged = string.IsNullOrEmpty(scan.ImportedFingerprint)
                 || !string.Equals(scan.ImportedFingerprint, scan.FetchedFingerprint, StringComparison.Ordinal)
                 || HasMissingLocalFiles(scan);
@@ -501,6 +502,29 @@ namespace GoogleDriveImporter
             }
 
             return false;
+        }
+
+        private static void ApplyCachedLocalMetadata(FolderScanResult scan, PresetFolderCache cache)
+        {
+            if (cache == null || cache.Files == null || cache.Files.Count == 0)
+                return;
+
+            var cachedFiles = new Dictionary<string, PresetFolderAssetCache>(StringComparer.Ordinal);
+            foreach (PresetFolderAssetCache file in cache.Files)
+            {
+                if (file != null && !string.IsNullOrEmpty(file.Id))
+                    cachedFiles[file.Id] = file;
+            }
+
+            foreach (RemoteAssetEntry file in scan.Files)
+            {
+                PresetFolderAssetCache cachedFile;
+                if (!cachedFiles.TryGetValue(file.Id, out cachedFile))
+                    continue;
+
+                file.LocalLastWriteTimeUtcTicks = cachedFile.LocalLastWriteTimeUtcTicks;
+                file.LocalMd5Checksum = cachedFile.LocalMd5Checksum;
+            }
         }
 
         private IEnumerator ScanFolder(
@@ -547,6 +571,9 @@ namespace GoogleDriveImporter
         {
             int changedFolders = 0;
             int maxParallelDownloads = ResolveMaxParallelDownloads(effectiveSettings);
+            var changedScans = new List<FolderScanResult>();
+            var allWorkItems = new List<ImportFileWork>();
+            var pendingDownloads = new List<ImportFileWork>();
             using (var client = new GoogleDriveRestClient(effectiveSettings))
             {
                 foreach (FolderScanResult scan in folderScans)
@@ -555,10 +582,32 @@ namespace GoogleDriveImporter
                         continue;
 
                     changedFolders++;
+                    changedScans.Add(scan);
                     skippedFileCount += scan.SkippedCount;
-                    status = "Importing " + scan.RootName + "...";
-                    yield return ImportFolder(client, scan, maxParallelDownloads);
+                    status = "Preparing " + scan.RootName + "...";
+                    PrepareImportFolder(scan, allWorkItems, pendingDownloads);
+                }
 
+                var progressState = new ImportProgressState();
+                UpdateImportProgress(allWorkItems, progressState, true);
+                if (pendingDownloads.Count > 0)
+                {
+                    var routines = new List<IEnumerator>(pendingDownloads.Count);
+                    for (int index = 0; index < pendingDownloads.Count; index++)
+                    {
+                        routines.Add(DownloadFile(
+                            client,
+                            pendingDownloads[index],
+                            allWorkItems,
+                            progressState));
+                    }
+
+                    yield return EditorCoroutineRunner.RunInParallel(routines, maxParallelDownloads);
+                    UpdateImportProgress(allWorkItems, progressState, true);
+                }
+
+                foreach (FolderScanResult scan in changedScans)
+                {
                     scan.ImportedFingerprint = scan.FetchedFingerprint;
                     scan.IsChanged = false;
                     SavePresetFolderCache(scan);
@@ -569,81 +618,77 @@ namespace GoogleDriveImporter
                 status = "No changed folders found.";
         }
 
-        private IEnumerator ImportFolder(
-            GoogleDriveRestClient client,
+        private void PrepareImportFolder(
             FolderScanResult scan,
-            int maxParallelDownloads)
+            List<ImportFileWork> allWorkItems,
+            List<ImportFileWork> pendingDownloads)
         {
             string headerPath = ResolveProjectPath(scan.Preset.Path);
             string localRoot = CombineSafePath(headerPath, scan.RootName);
             Directory.CreateDirectory(localRoot);
 
-            var workItems = new List<ImportFileWork>(scan.Files.Count);
-            var pendingDownloads = new List<ImportFileWork>(scan.Files.Count);
             for (int index = 0; index < scan.Files.Count; index++)
             {
                 RemoteAssetEntry file = scan.Files[index];
                 string fileName = file.PathSegments[file.PathSegments.Length - 1];
                 string filePath = CombinePathSegments(localRoot, file.PathSegments);
                 bool existed = File.Exists(filePath);
-                bool isUnchanged = IsLocalFileUnchanged(filePath, existed, file.Size, file.Md5Checksum);
+                bool isUnchanged = IsLocalFileUnchanged(file, filePath, existed);
 
                 var work = new ImportFileWork
                 {
+                    Scan = scan,
                     File = file,
                     FileName = fileName,
                     FilePath = filePath,
                     Existed = existed,
                     Progress = isUnchanged ? 1f : 0f
                 };
-                workItems.Add(work);
+                allWorkItems.Add(work);
 
                 if (isUnchanged)
                 {
                     existingFileCount++;
+                    UpdateLocalFileMetadata(file, filePath);
                     continue;
                 }
 
                 pendingDownloads.Add(work);
             }
-
-            UpdateImportProgress(scan, workItems);
-            if (pendingDownloads.Count > 0)
-            {
-                var routines = new List<IEnumerator>(pendingDownloads.Count);
-                for (int index = 0; index < pendingDownloads.Count; index++)
-                {
-                    ImportFileWork work = pendingDownloads[index];
-                    routines.Add(DownloadFile(client, scan, work, workItems));
-                }
-
-                yield return EditorCoroutineRunner.RunInParallel(routines, maxParallelDownloads);
-            }
         }
 
         private IEnumerator DownloadFile(
             GoogleDriveRestClient client,
-            FolderScanResult scan,
             ImportFileWork work,
-            List<ImportFileWork> workItems)
+            List<ImportFileWork> allWorkItems,
+            ImportProgressState progressState)
         {
-            status = "Downloading " + work.FileName + "...";
+            status = "Downloading " + work.Scan.RootName + ": " + work.FileName + "...";
             yield return client.DownloadFileToPath(work.File.Id, work.FilePath, progress =>
             {
                 work.Progress = progress;
-                UpdateImportProgress(scan, workItems);
+                UpdateImportProgress(allWorkItems, progressState, false);
             });
 
             work.Progress = 1f;
+            UpdateLocalFileMetadata(work.File, work.FilePath);
             if (work.Existed)
                 changedFileCount++;
             else
                 newFileCount++;
-            UpdateImportProgress(scan, workItems);
+            UpdateImportProgress(allWorkItems, progressState, false);
         }
 
-        private void UpdateImportProgress(FolderScanResult scan, List<ImportFileWork> workItems)
+        private void UpdateImportProgress(
+            List<ImportFileWork> workItems,
+            ImportProgressState progressState,
+            bool force)
         {
+            double now = EditorApplication.timeSinceStartup;
+            if (!force && progressState.LastUpdateTime >= 0d && now - progressState.LastUpdateTime < 0.1d)
+                return;
+
+            progressState.LastUpdateTime = now;
             float progress = 1f;
             if (workItems.Count > 0)
             {
@@ -655,9 +700,41 @@ namespace GoogleDriveImporter
 
             EditorUtility.DisplayProgressBar(
                 WindowTitle,
-                "Importing " + scan.RootName + " (" + Mathf.RoundToInt(progress * 100f) + "%)",
+                "Importing Google Drive assets (" + Mathf.RoundToInt(progress * 100f) + "%)",
                 progress);
             Repaint();
+        }
+
+        private static void UpdateLocalFileMetadata(RemoteAssetEntry file, string filePath)
+        {
+            if (!File.Exists(filePath))
+            {
+                file.LocalLastWriteTimeUtcTicks = 0L;
+                file.LocalMd5Checksum = string.Empty;
+                return;
+            }
+
+            var info = new FileInfo(filePath);
+            file.LocalLastWriteTimeUtcTicks = info.LastWriteTimeUtc.Ticks;
+            file.LocalMd5Checksum = file.Md5Checksum ?? string.Empty;
+        }
+
+        private static bool IsLocalFileUnchanged(RemoteAssetEntry file, string path, bool existed)
+        {
+            if (!existed)
+                return false;
+
+            var localInfo = new FileInfo(path);
+            if (localInfo.Length != file.Size)
+                return false;
+            if (string.IsNullOrEmpty(file.Md5Checksum))
+                return true;
+
+            if (file.LocalLastWriteTimeUtcTicks == localInfo.LastWriteTimeUtc.Ticks
+                && string.Equals(file.LocalMd5Checksum, file.Md5Checksum, StringComparison.OrdinalIgnoreCase))
+                return true;
+
+            return string.Equals(ComputeMd5(path), file.Md5Checksum, StringComparison.OrdinalIgnoreCase);
         }
 
         private static int ResolveMaxParallelDownloads(GoogleDriveEditorSettings settings)
@@ -672,20 +749,6 @@ namespace GoogleDriveImporter
                 configured,
                 1,
                 GoogleDriveEditorSettings.MaxSupportedParallelDownloads);
-        }
-
-        private static bool IsLocalFileUnchanged(string path, bool existed, long remoteSize, string remoteMd5)
-        {
-            if (!existed)
-                return false;
-
-            var localInfo = new FileInfo(path);
-            if (localInfo.Length != remoteSize)
-                return false;
-            if (string.IsNullOrEmpty(remoteMd5))
-                return true;
-
-            return string.Equals(ComputeMd5(path), remoteMd5, StringComparison.OrdinalIgnoreCase);
         }
 
         private bool HasChangedFolders()
@@ -832,7 +895,9 @@ namespace GoogleDriveImporter
                         Id = file.Id,
                         PathSegments = file.PathSegments,
                         Size = file.Size,
-                        Md5Checksum = file.Md5Checksum
+                        Md5Checksum = file.Md5Checksum,
+                        LocalLastWriteTimeUtcTicks = file.LocalLastWriteTimeUtcTicks,
+                        LocalMd5Checksum = file.LocalMd5Checksum
                     });
                 }
             }
@@ -905,7 +970,9 @@ namespace GoogleDriveImporter
                     Id = file.Id,
                     PathSegments = file.PathSegments,
                     Size = file.Size,
-                    Md5Checksum = file.Md5Checksum
+                    Md5Checksum = file.Md5Checksum,
+                    LocalLastWriteTimeUtcTicks = file.LocalLastWriteTimeUtcTicks,
+                    LocalMd5Checksum = file.LocalMd5Checksum
                 });
             }
 
@@ -927,15 +994,23 @@ namespace GoogleDriveImporter
             public string[] PathSegments;
             public long Size;
             public string Md5Checksum;
+            public long LocalLastWriteTimeUtcTicks;
+            public string LocalMd5Checksum;
         }
 
         private sealed class ImportFileWork
         {
+            public FolderScanResult Scan;
             public RemoteAssetEntry File;
             public string FileName;
             public string FilePath;
             public bool Existed;
             public float Progress;
+        }
+
+        private sealed class ImportProgressState
+        {
+            public double LastUpdateTime = -1d;
         }
 
         private sealed class FolderScanResult
