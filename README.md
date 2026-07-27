@@ -20,6 +20,11 @@ depend on `UnityGoogleDrive`, UniTask or other third-party packages.
 6. Open `Tools > GoogleDrive Importer`, assign both
    assets, then click **Authorize Google Drive**.
 
+If the project has Odin Inspector installed and the `ODIN_INSPECTOR` scripting
+define enabled, the tool opens as an `OdinEditorWindow` and draws its custom UI
+through Odin's inspector pipeline. Without Odin, it automatically uses Unity's
+built-in `EditorWindow`.
+
 ## Installation
 
 In Unity Package Manager, choose **Add package from git URL** and enter:
@@ -41,6 +46,16 @@ Commit the `PresetFolderId` asset to version control so teammates can share the
 same fetched snapshot and do not download the same update unnecessarily.
 Import uses the latest fetched snapshot; run Fetch Data again when you want to
 check Drive for new changes.
+
+Fetch Data also checks the local destination. If the imported root folder or
+any previously imported binary file is missing, the folder is marked as changed
+so Import Asset can restore it even when the Google Drive fingerprint is
+unchanged.
+
+Changed binary files are downloaded in parallel. The default is 4 simultaneous
+downloads; adjust `MaxParallelDownloads` on the `GoogleDriveEditorSettings`
+asset from 1 to 8 to balance speed against network or Google Drive API
+throttling.
 
 The first authorization opens the system browser and receives the OAuth result
 through a temporary localhost callback. Tokens are stored in Unity EditorPrefs;

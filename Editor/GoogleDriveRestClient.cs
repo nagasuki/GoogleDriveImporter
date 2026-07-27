@@ -129,7 +129,9 @@ namespace GoogleDriveImporter
             if (!string.IsNullOrEmpty(directory))
                 Directory.CreateDirectory(directory);
 
-            string temporaryPath = destinationPath + ".gdrive-download";
+            string temporaryPath = destinationPath
+                + ".gdrive-download-"
+                + Guid.NewGuid().ToString("N");
             if (File.Exists(temporaryPath))
                 File.Delete(temporaryPath);
 
