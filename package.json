@@ -1,0 +1,18 @@
+{
+  "name": "com.nagasuki.google-drive-importer",
+  "version": "1.0.0",
+  "displayName": "Google Drive Importer",
+  "description": "Editor-only Google Drive asset importer for Unity using the built-in REST API and IEnumerator workflows.",
+  "unity": "6000.0",
+  "documentationUrl": "https://github.com/nagasuki/GoogleDriveImporter#readme",
+  "author": {
+    "name": "Nagasuki",
+    "url": "https://github.com/nagasuki"
+  },
+  "keywords": [
+    "google-drive",
+    "asset-importer",
+    "editor"
+  ],
+  "dependencies": {}
+}
