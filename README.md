@@ -12,7 +12,7 @@ depend on `UnityGoogleDrive`, UniTask or other third-party packages.
 2. Create an OAuth client with application type **Desktop app**.
 3. In Unity, create `Google Drive Importer > Editor Settings` and fill in
    the OAuth client ID. The client secret is optional for Desktop clients.
-4. Create `Nanuq Tools > Google Drive > Folder Preset`.
+4. Create `Google Drive Importer > Folder Preset`.
 5. Add each root Drive folder to `PresetFolders`:
    - `Id`: the folder ID from its Drive URL.
    - `Path`: the destination header path, either absolute or relative to the

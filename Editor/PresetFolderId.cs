@@ -61,7 +61,7 @@ namespace GoogleDriveImporter
 
     [CreateAssetMenu(
         fileName = "PresetFolderId",
-        menuName = "Nanuq Tools/Google Drive/Folder Preset")]
+        menuName = "Google Drive Importer/Folder Preset")]
     public sealed class PresetFolderId : ScriptableObject
     {
         public List<PresetFolder> PresetFolders = new List<PresetFolder>();
