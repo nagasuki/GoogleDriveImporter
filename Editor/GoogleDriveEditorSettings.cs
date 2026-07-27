@@ -1,6 +1,5 @@
 #if UNITY_EDITOR
 using UnityEngine;
-using Sirenix.OdinInspector;
 
 namespace GoogleDriveImporter
 {
@@ -15,7 +14,7 @@ namespace GoogleDriveImporter
         [Tooltip("Optional for Desktop OAuth clients. Google treats this client secret as non-secret.")]
         public string ClientSecret;
 
-        [Tooltip("Read-only access is sufficient for this importer."), ReadOnly]
+        [Tooltip("Read-only access is sufficient for this importer.")]
         public string Scope = "https://www.googleapis.com/auth/drive.readonly";
     }
 

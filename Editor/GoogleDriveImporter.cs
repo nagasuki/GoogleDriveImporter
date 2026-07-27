@@ -16,12 +16,14 @@ namespace GoogleDriveImporter
     {
         public string Id;
         public string Path;
+
+        [NonSerialized]
+        public PresetFolder Source;
     }
 
-    public sealed class DownloadAssetFromGoogleDrive : EditorWindow
+    public sealed class GoogleDriveImporter : EditorWindow
     {
-        private const string WindowTitle = "Download Asset From Google Drive";
-        private const string FingerprintKeyPrefix = "GoogleDriveImporter.Fingerprint.";
+        private const string WindowTitle = "GoogleDrive Importer";
 
         [SerializeField]
         private PresetFolderId presetFolderId;
@@ -43,10 +45,10 @@ namespace GoogleDriveImporter
         private int existingFileCount;
         private int skippedFileCount;
 
-        [MenuItem("Window/Nanuq Tools/DownloadAssetFromGoogleDrive")]
+        [MenuItem("Tools/GoogleDrive Importer")]
         public static void ShowUpdateDataEditor()
         {
-            GetWindow<DownloadAssetFromGoogleDrive>(WindowTitle).Show();
+            GetWindow<GoogleDriveImporter>(WindowTitle).Show();
         }
 
         private void OnEnable()
@@ -269,7 +271,8 @@ namespace GoogleDriveImporter
                 folders.Add(new FolderClone
                 {
                     Id = folder.Id.Trim(),
-                    Path = folder.Path
+                    Path = folder.Path,
+                    Source = folder
                 });
             }
         }
@@ -406,7 +409,7 @@ namespace GoogleDriveImporter
                     FolderScanResult scan = null;
                     yield return ScanPresetFolder(client, folder, result => scan = result);
                     folderScans.Add(scan);
-                    SaveScanCache(scan);
+                    SavePresetFolderCache(scan);
                 }
             }
         }
@@ -428,10 +431,13 @@ namespace GoogleDriveImporter
 
             yield return ScanFolder(client, rootFolder.Id, new List<string>(), scan);
 
-            scan.Fingerprint = ComputeFingerprint(scan.FingerprintParts);
-            scan.PreviousFingerprint = EditorPrefs.GetString(GetFingerprintKey(folder), string.Empty);
-            scan.IsChanged = string.IsNullOrEmpty(scan.PreviousFingerprint)
-                || !string.Equals(scan.PreviousFingerprint, scan.Fingerprint, StringComparison.Ordinal);
+            scan.FetchedFingerprint = ComputeFingerprint(scan.FingerprintParts);
+            PresetFolderCache cache = GetPresetFolderCache(folder);
+            if (!IsCacheForFolder(cache, folder))
+                cache = null;
+            scan.ImportedFingerprint = cache == null ? string.Empty : cache.ImportedFingerprint;
+            scan.IsChanged = string.IsNullOrEmpty(scan.ImportedFingerprint)
+                || !string.Equals(scan.ImportedFingerprint, scan.FetchedFingerprint, StringComparison.Ordinal);
             onDone?.Invoke(scan);
         }
 
@@ -490,10 +496,9 @@ namespace GoogleDriveImporter
                     status = "Importing " + scan.RootName + "...";
                     yield return ImportFolder(client, scan);
 
-                    EditorPrefs.SetString(GetFingerprintKey(scan.Preset), scan.Fingerprint);
-                    scan.PreviousFingerprint = scan.Fingerprint;
+                    scan.ImportedFingerprint = scan.FetchedFingerprint;
                     scan.IsChanged = false;
-                    SaveScanCache(scan);
+                    SavePresetFolderCache(scan);
                 }
             }
 
@@ -660,19 +665,13 @@ namespace GoogleDriveImporter
                 return BitConverter.ToString(sha256.ComputeHash(data)).Replace("-", string.Empty).ToLowerInvariant();
         }
 
-        private static string GetFingerprintKey(FolderClone folder)
-        {
-            string identity = folder.Id + "\n" + folder.Path;
-            var parts = new List<string> { identity };
-            return FingerprintKeyPrefix + ComputeFingerprint(parts);
-        }
-
         private void LoadCachedScans()
         {
             folderScans.Clear();
             foreach (FolderClone folder in folders)
             {
-                FolderScanResult scan = LoadScanCache(folder);
+                PresetFolderCache cache = GetPresetFolderCache(folder);
+                FolderScanResult scan = CreateScanFromCache(folder, cache);
                 if (scan != null)
                     folderScans.Add(scan);
             }
@@ -682,25 +681,102 @@ namespace GoogleDriveImporter
                 status = "Loaded cached folder scan.";
         }
 
-        private static void SaveScanCache(FolderScanResult scan)
+        private FolderScanResult CreateScanFromCache(FolderClone folder, PresetFolderCache cache)
         {
-            string cacheDirectory = GetCacheDirectory();
-            Directory.CreateDirectory(cacheDirectory);
+            if (!IsCacheForFolder(cache, folder)
+                || string.IsNullOrEmpty(cache.RootName)
+                || string.IsNullOrEmpty(cache.FetchedFingerprint))
+                return null;
 
-            var cache = new FolderScanCache
+            var scan = new FolderScanResult(folder)
             {
-                RootName = scan.RootName,
-                Fingerprint = scan.Fingerprint,
-                LatestModifiedTime = scan.LatestModifiedTime == DateTimeOffset.MinValue
-                    ? string.Empty
-                    : scan.LatestModifiedTime.ToString("O", CultureInfo.InvariantCulture),
-                SkippedCount = scan.SkippedCount,
-                Files = new List<RemoteAssetCache>()
+                RootName = cache.RootName,
+                FetchedFingerprint = cache.FetchedFingerprint,
+                ImportedFingerprint = cache.ImportedFingerprint,
+                SkippedCount = cache.SkippedCount
             };
 
+            DateTimeOffset latestModifiedTime;
+            if (DateTimeOffset.TryParse(cache.LatestModifiedTime, out latestModifiedTime))
+                scan.LatestModifiedTime = latestModifiedTime;
+
+            scan.IsChanged = string.IsNullOrEmpty(scan.ImportedFingerprint)
+                || !string.Equals(scan.ImportedFingerprint, scan.FetchedFingerprint, StringComparison.Ordinal);
+
+            if (cache.Files != null)
+            {
+                foreach (PresetFolderAssetCache file in cache.Files)
+                {
+                    scan.Files.Add(new RemoteAssetEntry
+                    {
+                        Id = file.Id,
+                        PathSegments = file.PathSegments,
+                        Size = file.Size,
+                        Md5Checksum = file.Md5Checksum
+                    });
+                }
+            }
+
+            return scan;
+        }
+
+        private static bool IsCacheForFolder(PresetFolderCache cache, FolderClone folder)
+        {
+            return cache != null
+                && string.Equals(cache.FolderId, folder.Id, StringComparison.Ordinal)
+                && string.Equals(cache.HeaderPath ?? string.Empty, folder.Path ?? string.Empty, StringComparison.Ordinal);
+        }
+
+        private PresetFolderCache GetPresetFolderCache(FolderClone folder)
+        {
+            if (folder.Source != null)
+            {
+                if (folder.Source.Cache == null)
+                    folder.Source.Cache = new PresetFolderCache();
+                return folder.Source.Cache;
+            }
+
+            if (presetFolderId == null || presetFolderId.PresetFolders == null)
+                return null;
+
+            foreach (PresetFolder source in presetFolderId.PresetFolders)
+            {
+                if (source == null
+                    || !string.Equals(source.Id, folder.Id, StringComparison.Ordinal)
+                    || !string.Equals(source.Path, folder.Path, StringComparison.Ordinal))
+                    continue;
+
+                if (source.Cache == null)
+                    source.Cache = new PresetFolderCache();
+                return source.Cache;
+            }
+
+            return null;
+        }
+
+        private void SavePresetFolderCache(FolderScanResult scan)
+        {
+            PresetFolderCache cache = GetPresetFolderCache(scan.Preset);
+            if (cache == null)
+                throw new InvalidOperationException(
+                    "Could not save the Google Drive cache because its PresetFolder source is missing.");
+
+            cache.FolderId = scan.Preset.Id;
+            cache.HeaderPath = scan.Preset.Path ?? string.Empty;
+            cache.RootName = scan.RootName;
+            cache.FetchedFingerprint = scan.FetchedFingerprint;
+            cache.ImportedFingerprint = scan.ImportedFingerprint;
+            cache.LatestModifiedTime = scan.LatestModifiedTime == DateTimeOffset.MinValue
+                ? string.Empty
+                : scan.LatestModifiedTime.ToString("O", CultureInfo.InvariantCulture);
+            cache.SkippedCount = scan.SkippedCount;
+            if (cache.Files == null)
+                cache.Files = new List<PresetFolderAssetCache>();
+
+            cache.Files.Clear();
             foreach (RemoteAssetEntry file in scan.Files)
             {
-                cache.Files.Add(new RemoteAssetCache
+                cache.Files.Add(new PresetFolderAssetCache
                 {
                     Id = file.Id,
                     PathSegments = file.PathSegments,
@@ -709,68 +785,8 @@ namespace GoogleDriveImporter
                 });
             }
 
-            File.WriteAllText(GetCachePath(scan.Preset), JsonUtility.ToJson(cache));
-        }
-
-        private static FolderScanResult LoadScanCache(FolderClone folder)
-        {
-            string cachePath = GetCachePath(folder);
-            if (!File.Exists(cachePath))
-                return null;
-
-            try
-            {
-                FolderScanCache cache = JsonUtility.FromJson<FolderScanCache>(File.ReadAllText(cachePath));
-                if (cache == null || string.IsNullOrEmpty(cache.RootName) || string.IsNullOrEmpty(cache.Fingerprint))
-                    return null;
-
-                var scan = new FolderScanResult(folder)
-                {
-                    RootName = cache.RootName,
-                    Fingerprint = cache.Fingerprint,
-                    PreviousFingerprint = EditorPrefs.GetString(GetFingerprintKey(folder), string.Empty),
-                    SkippedCount = cache.SkippedCount
-                };
-
-                DateTimeOffset latestModifiedTime;
-                if (DateTimeOffset.TryParse(cache.LatestModifiedTime, out latestModifiedTime))
-                    scan.LatestModifiedTime = latestModifiedTime;
-
-                scan.IsChanged = string.IsNullOrEmpty(scan.PreviousFingerprint)
-                    || !string.Equals(scan.PreviousFingerprint, scan.Fingerprint, StringComparison.Ordinal);
-
-                if (cache.Files != null)
-                {
-                    foreach (RemoteAssetCache file in cache.Files)
-                    {
-                        scan.Files.Add(new RemoteAssetEntry
-                        {
-                            Id = file.Id,
-                            PathSegments = file.PathSegments,
-                            Size = file.Size,
-                            Md5Checksum = file.Md5Checksum
-                        });
-                    }
-                }
-
-                return scan;
-            }
-            catch (Exception exception)
-            {
-                Debug.LogWarning("Could not load Google Drive scan cache: " + exception.Message);
-                return null;
-            }
-        }
-
-        private static string GetCacheDirectory()
-        {
-            string projectPath = Directory.GetParent(Application.dataPath).FullName;
-            return Path.Combine(projectPath, "Library", "GoogleDriveImporter");
-        }
-
-        private static string GetCachePath(FolderClone folder)
-        {
-            return Path.Combine(GetCacheDirectory(), GetFingerprintKey(folder) + ".json");
+            EditorUtility.SetDirty(presetFolderId);
+            AssetDatabase.SaveAssets();
         }
 
         private void ResetCounters()
@@ -789,33 +805,14 @@ namespace GoogleDriveImporter
             public string Md5Checksum;
         }
 
-        [Serializable]
-        private sealed class FolderScanCache
-        {
-            public string RootName;
-            public string Fingerprint;
-            public string LatestModifiedTime;
-            public int SkippedCount;
-            public List<RemoteAssetCache> Files;
-        }
-
-        [Serializable]
-        private sealed class RemoteAssetCache
-        {
-            public string Id;
-            public string[] PathSegments;
-            public long Size;
-            public string Md5Checksum;
-        }
-
         private sealed class FolderScanResult
         {
             public readonly FolderClone Preset;
             public readonly List<RemoteAssetEntry> Files = new List<RemoteAssetEntry>();
             public readonly List<string> FingerprintParts = new List<string>();
             public string RootName;
-            public string Fingerprint;
-            public string PreviousFingerprint;
+            public string FetchedFingerprint;
+            public string ImportedFingerprint;
             public bool IsChanged;
             public int SkippedCount;
             public DateTimeOffset LatestModifiedTime = DateTimeOffset.MinValue;
