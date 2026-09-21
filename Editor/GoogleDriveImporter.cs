@@ -252,7 +252,7 @@ namespace GoogleDriveImporter
 
         private void DrawFolderStatus(FolderClone folder)
         {
-            FolderScanResult scan = FindScan(folder.Id);
+            FolderScanResult scan = FindScan(folder);
             using (new EditorGUILayout.VerticalScope("box"))
             {
                 if (scan == null)
@@ -304,21 +304,77 @@ namespace GoogleDriveImporter
         private void SyncPresetFolders()
         {
             folders.Clear();
-            if (presetFolderId == null || presetFolderId.PresetFolders == null)
+            if (presetFolderId == null)
                 return;
 
-            foreach (var folder in presetFolderId.PresetFolders)
+            if (presetFolderId.Groups != null)
             {
-                if (string.IsNullOrWhiteSpace(folder.Id))
-                    continue;
-
-                folders.Add(new FolderClone
+                foreach (PresetFolderGroup group in presetFolderId.Groups)
                 {
-                    Id = folder.Id.Trim(),
-                    Path = folder.Path,
-                    Source = folder
-                });
+                    if (group == null)
+                        continue;
+
+                    AddFolderClone(group, group.Path);
+
+                    if (group.Children == null)
+                        continue;
+
+                    foreach (PresetFolder child in group.Children)
+                    {
+                        if (child == null)
+                            continue;
+
+                        AddFolderClone(child, ResolveGroupedPath(group.Path, child.Path));
+                    }
+                }
             }
+
+            // Existing assets keep their original flat mappings and remain importable.
+            if (presetFolderId.PresetFolders == null)
+                return;
+
+            foreach (PresetFolder folder in presetFolderId.PresetFolders)
+                AddFolderClone(folder, folder == null ? null : folder.Path);
+        }
+
+        private void AddFolderClone(PresetFolder source, string path)
+        {
+            if (source == null || string.IsNullOrWhiteSpace(source.Id))
+                return;
+
+            string folderId = source.Id.Trim();
+            foreach (FolderClone existing in folders)
+            {
+                if (string.Equals(existing.Id, folderId, StringComparison.Ordinal)
+                    && string.Equals(existing.Path ?? string.Empty, path ?? string.Empty, StringComparison.Ordinal))
+                    return;
+            }
+
+            folders.Add(new FolderClone
+            {
+                Id = folderId,
+                Path = path,
+                Source = source
+            });
+        }
+
+        private static string ResolveGroupedPath(string groupPath, string childPath)
+        {
+            string child = (childPath ?? string.Empty).Trim();
+            if (string.IsNullOrEmpty(child))
+                return groupPath;
+
+            string normalizedChild = child.Replace('\\', '/');
+            bool isAssetsPath = string.Equals(normalizedChild, "Assets", StringComparison.OrdinalIgnoreCase)
+                || normalizedChild.StartsWith("Assets/", StringComparison.OrdinalIgnoreCase);
+            if (System.IO.Path.IsPathRooted(child) || isAssetsPath)
+                return child;
+
+            string parent = (groupPath ?? string.Empty).Trim();
+            if (string.IsNullOrEmpty(parent))
+                return child;
+
+            return parent.TrimEnd('/', '\\') + "/" + child.TrimStart('/', '\\');
         }
 
         private GoogleDriveEditorSettings GetEffectiveSettings()
@@ -768,11 +824,12 @@ namespace GoogleDriveImporter
             return count;
         }
 
-        private FolderScanResult FindScan(string folderId)
+        private FolderScanResult FindScan(FolderClone folder)
         {
             foreach (FolderScanResult scan in folderScans)
             {
-                if (string.Equals(scan.Preset.Id, folderId, StringComparison.Ordinal))
+                if (string.Equals(scan.Preset.Id, folder.Id, StringComparison.Ordinal)
+                    && string.Equals(scan.Preset.Path ?? string.Empty, folder.Path ?? string.Empty, StringComparison.Ordinal))
                     return scan;
             }
 
@@ -925,22 +982,55 @@ namespace GoogleDriveImporter
                 return folder.Source.Cache;
             }
 
-            if (presetFolderId == null || presetFolderId.PresetFolders == null)
+            if (presetFolderId == null)
                 return null;
 
-            foreach (PresetFolder source in presetFolderId.PresetFolders)
+            if (presetFolderId.Groups != null)
             {
-                if (source == null
-                    || !string.Equals(source.Id, folder.Id, StringComparison.Ordinal)
-                    || !string.Equals(source.Path, folder.Path, StringComparison.Ordinal))
-                    continue;
+                foreach (PresetFolderGroup group in presetFolderId.Groups)
+                {
+                    if (group == null)
+                        continue;
 
-                if (source.Cache == null)
-                    source.Cache = new PresetFolderCache();
-                return source.Cache;
+                    PresetFolderCache groupCache = FindMatchingCache(group, folder);
+                    if (groupCache != null)
+                        return groupCache;
+
+                    if (group.Children == null)
+                        continue;
+
+                    foreach (PresetFolder child in group.Children)
+                    {
+                        PresetFolderCache childCache = FindMatchingCache(child, folder);
+                        if (childCache != null)
+                            return childCache;
+                    }
+                }
+            }
+
+            if (presetFolderId.PresetFolders != null)
+            {
+                foreach (PresetFolder source in presetFolderId.PresetFolders)
+                {
+                    PresetFolderCache cache = FindMatchingCache(source, folder);
+                    if (cache != null)
+                        return cache;
+                }
             }
 
             return null;
+        }
+
+        private static PresetFolderCache FindMatchingCache(PresetFolder source, FolderClone folder)
+        {
+            if (source == null
+                || !string.Equals(source.Id, folder.Id, StringComparison.Ordinal))
+                return null;
+
+            if (source.Cache == null)
+                source.Cache = new PresetFolderCache();
+
+            return IsCacheForFolder(source.Cache, folder) ? source.Cache : null;
         }
 
         private void SavePresetFolderCache(FolderScanResult scan)

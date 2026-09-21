@@ -13,12 +13,26 @@ depend on `UnityGoogleDrive`, UniTask or other third-party packages.
 3. In Unity, create `Google Drive Importer > Editor Settings` and fill in
    the OAuth client ID. The client secret is optional for Desktop clients.
 4. Create `Google Drive Importer > Folder Preset`.
-5. Add each root Drive folder to `PresetFolders`:
-   - `Id`: the folder ID from its Drive URL.
-   - `Path`: the destination header path, either absolute or relative to the
-     Unity project, such as `Assets/GameData`.
+5. Add a `Groups` entry for each destination section:
+   - Group `Path`: the destination header path, either absolute or relative to
+     the Unity project, such as `Assets/GameData`.
+   - Group `Id`: optional. If set, the Drive folder with this ID is imported
+     below the group path.
+   - Group `Children`: add any additional Drive folders. Each child has its own
+     `Id` and optional `Path`. A blank child path uses the group path; a relative
+     path such as `Characters` creates a subfolder under the group path; a path
+     beginning with `Assets/` or an absolute path overrides the group path.
+   - The Drive folder's own name is created below its resolved destination path.
 6. Open `Tools > GoogleDrive Importer`, assign both
    assets, then click **Authorize Google Drive**.
+
+Existing assets using the flat `PresetFolders` list remain supported. New
+folder mappings can be added under `Groups` to keep related destinations
+together.
+
+When Odin Inspector is installed and `ODIN_INSPECTOR` is enabled, destination
+path fields also use Odin's `[FolderPath]` picker. The picker is relative to the
+Unity project by default, and paths do not need to exist before importing.
 
 If the project has Odin Inspector installed and the `ODIN_INSPECTOR` scripting
 define enabled, the tool opens as an `OdinEditorWindow` and draws its custom UI
