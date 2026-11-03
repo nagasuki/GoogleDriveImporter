@@ -33,6 +33,9 @@ namespace GoogleDriveImporter
 #endif
     {
         private const string WindowTitle = "GoogleDrive Importer";
+        private const float ScanProgressEnd = 0.2f;
+        private const float PreparationProgressEnd = 0.3f;
+        private const float DownloadProgressEnd = 0.95f;
 
         [SerializeField, HideInInspector]
         private PresetFolderId presetFolderId;
@@ -44,7 +47,6 @@ namespace GoogleDriveImporter
         private readonly List<FolderScanResult> folderScans = new List<FolderScanResult>();
         private Vector2 scrollPosition;
         private bool isBusy;
-        private bool hasScan;
         private bool authenticationExpanded;
         private bool wasAuthorized;
         private bool searchedSettings;
@@ -53,6 +55,11 @@ namespace GoogleDriveImporter
         private int changedFileCount;
         private int existingFileCount;
         private int skippedFileCount;
+        private bool hasProgress;
+        private bool ownsProgressBar;
+        private float progressValue;
+        private string progressDetails;
+        private double lastProgressUpdate = -1d;
 
         [MenuItem("Tools/GoogleDrive Importer")]
         public static void ShowUpdateDataEditor()
@@ -62,6 +69,10 @@ namespace GoogleDriveImporter
 
         private void InitializeImporter()
         {
+            AssemblyReloadEvents.beforeAssemblyReload -= ClearNativeProgress;
+            AssemblyReloadEvents.beforeAssemblyReload += ClearNativeProgress;
+            EditorApplication.quitting -= ClearNativeProgress;
+            EditorApplication.quitting += ClearNativeProgress;
             searchedSettings = false;
             SyncPresetFolders();
             LoadCachedScans();
@@ -69,11 +80,24 @@ namespace GoogleDriveImporter
             authenticationExpanded = !wasAuthorized || GetEffectiveSettings() == null;
         }
 
+        private void CleanupImporter()
+        {
+            ClearNativeProgress();
+            AssemblyReloadEvents.beforeAssemblyReload -= ClearNativeProgress;
+            EditorApplication.quitting -= ClearNativeProgress;
+        }
+
 #if ODIN_INSPECTOR
         protected override void OnEnable()
         {
             base.OnEnable();
             InitializeImporter();
+        }
+
+        protected override void OnDisable()
+        {
+            CleanupImporter();
+            base.OnDisable();
         }
 
         [OnInspectorGUI]
@@ -87,6 +111,11 @@ namespace GoogleDriveImporter
             InitializeImporter();
         }
 
+        private void OnDisable()
+        {
+            CleanupImporter();
+        }
+
         private void OnGUI()
         {
             DrawWindowGUI();
@@ -97,15 +126,18 @@ namespace GoogleDriveImporter
         {
             EditorGUILayout.LabelField(WindowTitle, EditorStyles.boldLabel);
             EditorGUILayout.HelpBox(
-                "Fetch Data checks Google Drive for changes. Import Asset downloads only the folders marked as changed.",
+                "Fetch & Import checks Google Drive and downloads only new or changed files. Matching local files are skipped.",
                 MessageType.Info);
 
             EditorGUI.BeginChangeCheck();
-            presetFolderId = (PresetFolderId)EditorGUILayout.ObjectField(
-                "Folder preset",
-                presetFolderId,
-                typeof(PresetFolderId),
-                false);
+            using (new EditorGUI.DisabledScope(isBusy))
+            {
+                presetFolderId = (PresetFolderId)EditorGUILayout.ObjectField(
+                    "Folder preset",
+                    presetFolderId,
+                    typeof(PresetFolderId),
+                    false);
+            }
             if (EditorGUI.EndChangeCheck())
             {
                 if (presetFolderId != null && presetFolderId.Settings != null)
@@ -196,19 +228,7 @@ namespace GoogleDriveImporter
             {
                 EditorGUILayout.LabelField("Google Drive folders", EditorStyles.boldLabel);
 
-                if (EditorGUIUtility.currentViewWidth < 560f)
-                {
-                    DrawFetchButton();
-                    DrawImportButton();
-                }
-                else
-                {
-                    using (new EditorGUILayout.HorizontalScope())
-                    {
-                        DrawFetchButton();
-                        DrawImportButton();
-                    }
-                }
+                DrawFetchAndImportButton();
 
                 if (presetFolderId == null)
                 {
@@ -229,6 +249,12 @@ namespace GoogleDriveImporter
             }
 
             EditorGUILayout.Space(4);
+            if (hasProgress)
+            {
+                EditorGUI.ProgressBar(EditorGUILayout.GetControlRect(false, 20f), progressValue,
+                    ProgressLabel);
+                EditorGUILayout.Space(4);
+            }
             EditorGUILayout.LabelField(status, EditorStyles.wordWrappedLabel);
             if (isBusy)
                 Repaint();
@@ -258,7 +284,7 @@ namespace GoogleDriveImporter
             }
         }
 
-        private void DrawFetchButton()
+        private void DrawFetchAndImportButton()
         {
             using (new EditorGUI.DisabledScope(
                 isBusy
@@ -267,21 +293,8 @@ namespace GoogleDriveImporter
                 || !GoogleDriveAuth.HasRefreshToken(GetEffectiveSettings())
                 || GetEffectiveSettings() == null))
             {
-                if (GUILayout.Button("Fetch Data", GUILayout.MinHeight(28f)))
-                    StartFetchData();
-            }
-        }
-
-        private void DrawImportButton()
-        {
-            using (new EditorGUI.DisabledScope(
-                isBusy
-                || !hasScan
-                || !HasChangedFolders()
-                || GetEffectiveSettings() == null))
-            {
-                if (GUILayout.Button("Import Asset", GUILayout.MinHeight(28f)))
-                    StartImport();
+                if (GUILayout.Button("Fetch & Import", GUILayout.MinHeight(32f)))
+                    StartFetchAndImport();
             }
         }
 
@@ -422,8 +435,18 @@ namespace GoogleDriveImporter
                 HandleRoutineError);
         }
 
-        private void StartFetchData()
+        private void StartFetchAndImport()
         {
+            if (isBusy)
+                return;
+
+            SyncPresetFolders();
+            if (presetFolderId == null || folders.Count == 0)
+            {
+                status = "Assign a folder preset with at least one Google Drive folder.";
+                return;
+            }
+
             GoogleDriveEditorSettings effectiveSettings = GetEffectiveSettings();
             if (effectiveSettings == null)
             {
@@ -433,69 +456,59 @@ namespace GoogleDriveImporter
                 return;
             }
 
+            if (!GoogleDriveAuth.HasRefreshToken(effectiveSettings))
+            {
+                authenticationExpanded = true;
+                status = "Authorize Google Drive before fetching and importing.";
+                return;
+            }
+
             isBusy = true;
-            hasScan = false;
+            ResetCounters();
             folderScans.Clear();
             status = "Fetching Google Drive data...";
+            BeginProgress("Scanning Drive folders...");
             EditorAsyncRunner.Start(
-                () => ReloadPresetFolders(effectiveSettings),
+                () => FetchAndImport(effectiveSettings),
                 () =>
                 {
-                    hasScan = true;
-                    int changedCount = CountChangedFolders();
-                    status = changedCount == 0
-                        ? "Fetch completed. All folders are up to date."
-                        : string.Format("Fetch completed. {0} folder(s) need import.", changedCount);
+                    CompleteProgress(status);
                     isBusy = false;
                     Repaint();
                 },
                 HandleRoutineError);
         }
 
-        private void StartImport()
+        private async Task FetchAndImport(GoogleDriveEditorSettings effectiveSettings)
         {
-            GoogleDriveEditorSettings effectiveSettings = GetEffectiveSettings();
-            if (effectiveSettings == null)
+            // Always scan first; cached results are only a display/checksum cache,
+            // never a substitute for checking Drive at the start of this action.
+            await ReloadPresetFolders(effectiveSettings);
+            if (!HasChangedFolders())
             {
-                authenticationExpanded = true;
-                status = "Assign GoogleDriveEditorSettings with a Client ID first.";
-                Repaint();
+                status = "All files are up to date. Nothing downloaded.";
                 return;
             }
 
-            if (!hasScan || !HasChangedFolders())
-            {
-                status = "Fetch Data first, or all folders are already up to date.";
-                Repaint();
-                return;
-            }
-
-            isBusy = true;
-            ResetCounters();
-            status = "Importing fetched changes...";
-            EditorAsyncRunner.Start(
-                () => ImportChangedFolders(effectiveSettings),
-                () =>
-                {
-                    status = string.Format(
-                        "Finished. New: {0}, changed: {1}, existing: {2}, skipped: {3}.",
-                        newFileCount,
-                        changedFileCount,
-                        existingFileCount,
-                        skippedFileCount);
-                    AssetDatabase.Refresh();
-                    EditorUtility.ClearProgressBar();
-                    isBusy = false;
-                    Repaint();
-                },
-                HandleRoutineError);
+            status = "Checking local files and importing changes...";
+            ReportProgress(ScanProgressEnd, "Checking local files...", true);
+            await ImportChangedFolders(effectiveSettings);
+            ReportProgress(0.99f, "Importing assets into Unity...", true);
+            AssetDatabase.Refresh();
+            status = string.Format(
+                "Finished. New: {0}, changed: {1}, existing: {2}, skipped: {3}.",
+                newFileCount,
+                changedFileCount,
+                existingFileCount,
+                skippedFileCount);
         }
 
         private void HandleRoutineError(Exception exception)
         {
             status = exception.Message;
             Debug.LogException(exception);
-            EditorUtility.ClearProgressBar();
+            progressDetails = "Failed: " + exception.Message;
+            ClearNativeProgress();
             isBusy = false;
             Repaint();
         }
@@ -507,11 +520,15 @@ namespace GoogleDriveImporter
                 foreach (var folder in folders)
                 {
                     status = "Scanning folder " + folder.Id + "...";
+                    ReportProgress(ScanProgressEnd * folderScans.Count / Math.Max(1, folders.Count),
+                        "Scanning folder " + (folderScans.Count + 1) + "/" + folders.Count + "...", true);
                     Repaint();
 
                     FolderScanResult scan = await ScanPresetFolder(client, folder);
                     folderScans.Add(scan);
                     SavePresetFolderCache(scan);
+                    ReportProgress(ScanProgressEnd * folderScans.Count / Math.Max(1, folders.Count),
+                        "Scanned " + folderScans.Count + "/" + folders.Count + " folders", true);
                 }
             }
         }
@@ -604,6 +621,8 @@ namespace GoogleDriveImporter
             List<string> parentSegments,
             FolderScanResult scan)
         {
+            ReportProgress(ScanProgressEnd * folderScans.Count / Math.Max(1, folders.Count),
+                "Scanning " + scan.RootName + ": " + scan.Files.Count + " files found");
             GoogleDriveFileList fileList = await client.ListFilesInFolder(folderId);
             GoogleDriveFile[] files = fileList == null || fileList.Files == null
                 ? Array.Empty<GoogleDriveFile>()
@@ -645,6 +664,12 @@ namespace GoogleDriveImporter
             var changedScans = new List<FolderScanResult>();
             var allWorkItems = new List<ImportFileWork>();
             var pendingDownloads = new List<ImportFileWork>();
+            var progressState = new ImportProgressState();
+            foreach (FolderScanResult scan in folderScans)
+            {
+                if (scan.IsChanged)
+                    progressState.TotalFiles += scan.Files.Count;
+            }
             try
             {
                 using (var client = new GoogleDriveRestClient(effectiveSettings))
@@ -658,10 +683,9 @@ namespace GoogleDriveImporter
                         changedScans.Add(scan);
                         skippedFileCount += scan.SkippedCount;
                         status = "Preparing " + scan.RootName + "...";
-                        await PrepareImportFolder(scan, allWorkItems, pendingDownloads);
+                        await PrepareImportFolder(scan, allWorkItems, pendingDownloads, progressState);
                     }
 
-                    var progressState = new ImportProgressState();
                     UpdateImportProgress(allWorkItems, progressState, true);
                     if (pendingDownloads.Count > 0)
                     {
@@ -671,8 +695,11 @@ namespace GoogleDriveImporter
                         UpdateImportProgress(allWorkItems, progressState, true);
                     }
 
-                    foreach (FolderScanResult scan in changedScans)
+                    for (int index = 0; index < changedScans.Count; index++)
                     {
+                        FolderScanResult scan = changedScans[index];
+                        ReportProgress(DownloadProgressEnd + 0.03f * (index + 1) / changedScans.Count,
+                            "Saving folder cache: " + (index + 1) + "/" + changedScans.Count, true);
                         scan.ImportedFingerprint = scan.FetchedFingerprint;
                         scan.IsChanged = false;
                         SavePresetFolderCache(scan);
@@ -697,7 +724,8 @@ namespace GoogleDriveImporter
         private async Task PrepareImportFolder(
             FolderScanResult scan,
             List<ImportFileWork> allWorkItems,
-            List<ImportFileWork> pendingDownloads)
+            List<ImportFileWork> pendingDownloads,
+            ImportProgressState progressState)
         {
             string headerPath = ResolveProjectPath(scan.Preset.Path);
             string localRoot = CombineSafePath(headerPath, scan.RootName);
@@ -718,9 +746,14 @@ namespace GoogleDriveImporter
                     FileName = fileName,
                     FilePath = filePath,
                     Existed = existed,
-                    Progress = isUnchanged ? 1f : 0f
+                    Progress = isUnchanged ? 1f : 0f,
+                    IsComplete = isUnchanged
                 };
                 allWorkItems.Add(work);
+                progressState.PreparedFiles++;
+                ReportProgress(ScanProgressEnd + (PreparationProgressEnd - ScanProgressEnd)
+                    * progressState.PreparedFiles / Math.Max(1, progressState.TotalFiles),
+                    "Checking local files: " + progressState.PreparedFiles + "/" + progressState.TotalFiles);
 
                 if (isUnchanged)
                 {
@@ -747,6 +780,7 @@ namespace GoogleDriveImporter
 
             work.Progress = 1f;
             await GoogleDriveLocalFileCache.UpdateMetadataAsync(work.File, work.FilePath);
+            work.IsComplete = true;
             if (work.Existed)
                 changedFileCount++;
             else
@@ -764,20 +798,66 @@ namespace GoogleDriveImporter
                 return;
 
             progressState.LastUpdateTime = now;
-            float progress = 1f;
-            if (workItems.Count > 0)
+            double completedBytes = 0d;
+            double totalBytes = 0d;
+            int completedFiles = 0;
+            foreach (ImportFileWork work in workItems)
             {
-                progress = 0f;
-                for (int index = 0; index < workItems.Count; index++)
-                    progress += Mathf.Clamp01(workItems[index].Progress);
-                progress /= workItems.Count;
+                double weight = Math.Max(1L, work.File.Size);
+                totalBytes += weight;
+                // Reserve part of each file for checksum verification, so a
+                // completed HTTP request isn't counted as a verified file yet.
+                completedBytes += weight * (work.IsComplete ? 1d : 0.95d * Mathf.Clamp01(work.Progress));
+                if (work.IsComplete)
+                    completedFiles++;
             }
 
-            EditorUtility.DisplayProgressBar(
-                WindowTitle,
-                "Importing Google Drive assets (" + Mathf.RoundToInt(progress * 100f) + "%)",
-                progress);
+            float fraction = totalBytes > 0d ? (float)(completedBytes / totalBytes) : 1f;
+            ReportProgress(PreparationProgressEnd + (DownloadProgressEnd - PreparationProgressEnd) * fraction,
+                "Downloading / verifying: " + completedFiles + "/" + workItems.Count
+                + " files (" + existingFileCount + " unchanged)", true);
+        }
+
+        private string ProgressLabel
+        {
+            get { return Mathf.FloorToInt(progressValue * 100f) + "% - " + progressDetails; }
+        }
+
+        private void BeginProgress(string details)
+        {
+            hasProgress = true;
+            progressValue = 0f;
+            lastProgressUpdate = -1d;
+            ReportProgress(0f, details, true);
+        }
+
+        private void ReportProgress(float value, string details, bool force = false)
+        {
+            if (this == null)
+                return;
+            progressValue = Mathf.Max(progressValue, Mathf.Clamp01(value));
+            progressDetails = details;
+            double now = EditorApplication.timeSinceStartup;
+            if (!force && lastProgressUpdate >= 0d && now - lastProgressUpdate < 0.1d)
+                return;
+            lastProgressUpdate = now;
+            ownsProgressBar = true;
+            EditorUtility.DisplayProgressBar(WindowTitle, ProgressLabel, progressValue);
             Repaint();
+        }
+
+        private void CompleteProgress(string details)
+        {
+            ReportProgress(1f, details, true);
+            ClearNativeProgress();
+        }
+
+        private void ClearNativeProgress()
+        {
+            if (!ownsProgressBar)
+                return;
+            ownsProgressBar = false;
+            EditorUtility.ClearProgressBar();
         }
 
         private static int ResolveMaxParallelDownloads(GoogleDriveEditorSettings settings)
@@ -899,8 +979,7 @@ namespace GoogleDriveImporter
                     folderScans.Add(scan);
             }
 
-            hasScan = folders.Count > 0 && folderScans.Count == folders.Count;
-            if (hasScan)
+            if (folders.Count > 0 && folderScans.Count == folders.Count)
                 status = "Loaded cached folder scan.";
         }
 
@@ -1048,11 +1127,14 @@ namespace GoogleDriveImporter
             public string FilePath;
             public bool Existed;
             public float Progress;
+            public bool IsComplete;
         }
 
         private sealed class ImportProgressState
         {
             public double LastUpdateTime = -1d;
+            public int PreparedFiles;
+            public int TotalFiles;
         }
 
         private sealed class FolderScanResult
@@ -1087,7 +1169,7 @@ namespace GoogleDriveImporter
                 get
                 {
                     if (IsChanged)
-                        return "Changed - Import Asset required";
+                        return "Changed - run Fetch & Import to update";
                     return "Up to date";
                 }
             }

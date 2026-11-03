@@ -52,10 +52,17 @@ In Unity Package Manager, choose **Add package from git URL** and enter:
 
 ## Current workflow
 
-1. Click **Fetch Data** to scan the Drive folders and review their names,
-   Last Update, and change status. This step does not download assets.
-2. Click **Import Asset** to import only folders marked as changed by the
-   latest fetch. If everything is up to date, the button remains disabled.
+Click **Fetch & Import** to scan the Drive folders, check local file contents,
+and immediately import new or changed assets. Matching files are skipped. If
+everything is up to date, the operation completes without downloading anything.
+The button remains available for the next check and is disabled while busy.
+
+One Editor progress bar runs from 0 to 100%, with the current stage and completed
+folder/file counts. Scanning uses 0-20%, local checks use 20-30%, and downloads
+and checksum verification use 30-95%, weighted by file size. The final stage saves
+the cache and imports assets into Unity. It reaches 100% after the
+whole operation finishes; the tool keeps the final percentage visible. The
+popup closes on completion, failure, window close, or script reload.
 
 Fetch results are stored in hidden serialized cache fields on the assigned
 `PresetFolderId` asset, so closing and reopening the tool keeps the folder
@@ -63,15 +70,15 @@ names, Last Update, change status, and scanned file list. The asset stores both
 the latest fetched fingerprint and the last successfully imported fingerprint.
 Commit the `PresetFolderId` asset to version control so teammates can share the
 same fetched snapshot and do not download the same update unnecessarily.
-Import uses the latest fetched snapshot; run Fetch Data again when you want to
-check Drive for new changes.
+Each click refreshes the Drive snapshot before importing, so a cached scan never
+causes new Drive changes to be overlooked.
 
-Fetch Data also checks the actual bytes of local files against Drive's MD5
+Fetch & Import also checks the actual bytes of local files against Drive's MD5
 checksums. Missing files, changed bytes (including same-size edits), and changed
 Drive versions mark the folder for import. Matching files are skipped even if
 another file in the same folder changed. Checksums are computed by streaming the
 local bytes, without downloading another copy or retaining a whole image in RAM.
-During Fetch/Import, file reads and hashing run on up to four background workers;
+During Fetch & Import, file reads and hashing run on up to four background workers;
 cache updates and Unity APIs resume on the editor thread.
 
 For a binary file without a Drive checksum, the importer records its remote
@@ -111,7 +118,7 @@ The importer lists recursively, follows pagination, supports My Drive and
 Shared Drive items, uses the Google Drive folder/file names as-is, downloads
 binary files, and skips Google Workspace files. The selected root folder is
 created below the configured header path. Existing files are compared by size
-and, when available, MD5 checksum. Fetch Data also computes a recursive snapshot
+and, when available, MD5 checksum. Fetch & Import also computes a recursive snapshot
 so additions, removals, renames, and nested file changes are detected even if
 the root folder's own `modifiedTime` did not change. Local files are not
 deleted automatically when a remote file is removed.

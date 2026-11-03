@@ -71,7 +71,7 @@ namespace GoogleDriveImporter
                 throw new FileNotFoundException("Downloaded file is missing.", path);
             if (snapshot.Length != file.Size || (!string.IsNullOrEmpty(file.Md5Checksum)
                 && !string.Equals(snapshot.Checksum, file.Md5Checksum, StringComparison.OrdinalIgnoreCase)))
-                throw new InvalidOperationException("Downloaded file does not match the fetched Drive version. Fetch Data again: " + path);
+                throw new InvalidOperationException("Downloaded file does not match the fetched Drive version. Run Fetch & Import again: " + path);
 
             RecordVersion(file, snapshot);
         }
