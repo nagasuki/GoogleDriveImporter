@@ -47,6 +47,13 @@ namespace GoogleDriveImporter
         private readonly List<FolderScanResult> folderScans = new List<FolderScanResult>();
         private Vector2 scrollPosition;
         private bool isBusy;
+        private bool verifyAll;
+        private int maxParallelScans = 8;
+        private double remoteSeconds;
+        private double localSeconds;
+        private double importSeconds;
+        private int fullScanCount;
+        private int incrementalScanCount;
         private bool authenticationExpanded;
         private bool wasAuthorized;
         private bool searchedSettings;
@@ -294,7 +301,10 @@ namespace GoogleDriveImporter
                 || GetEffectiveSettings() == null))
             {
                 if (GUILayout.Button("Fetch & Import", GUILayout.MinHeight(32f)))
-                    StartFetchAndImport();
+                    StartFetchAndImport(false);
+                if (GUILayout.Button("Verify All & Import"))
+                    StartFetchAndImport(true);
+                EditorGUILayout.LabelField("Fast checks use file size and modification time. Verify All checks every file checksum.", EditorStyles.wordWrappedMiniLabel);
             }
         }
 
@@ -435,7 +445,7 @@ namespace GoogleDriveImporter
                 HandleRoutineError);
         }
 
-        private void StartFetchAndImport()
+        private void StartFetchAndImport(bool verify)
         {
             if (isBusy)
                 return;
@@ -464,6 +474,10 @@ namespace GoogleDriveImporter
             }
 
             isBusy = true;
+            verifyAll = verify;
+            remoteSeconds = localSeconds = importSeconds = 0;
+            fullScanCount = incrementalScanCount = 0;
+            maxParallelScans = Math.Max(1, Math.Min(32, effectiveSettings.MaxParallelScans));
             ResetCounters();
             folderScans.Clear();
             status = "Fetching Google Drive data...";
@@ -472,6 +486,8 @@ namespace GoogleDriveImporter
                 () => FetchAndImport(effectiveSettings),
                 () =>
                 {
+                    status += string.Format(" Remote: {0:F2}s ({1} full, {2} incremental), local: {3:F2}s, import: {4:F2}s.",
+                        remoteSeconds, fullScanCount, incrementalScanCount, localSeconds, importSeconds);
                     CompleteProgress(status);
                     isBusy = false;
                     Repaint();
@@ -481,8 +497,7 @@ namespace GoogleDriveImporter
 
         private async Task FetchAndImport(GoogleDriveEditorSettings effectiveSettings)
         {
-            // Always scan first; cached results are only a display/checksum cache,
-            // never a substitute for checking Drive at the start of this action.
+            // Consult Drive's change log before reusing a remote snapshot.
             await ReloadPresetFolders(effectiveSettings);
             if (!HasChangedFolders())
             {
@@ -492,9 +507,11 @@ namespace GoogleDriveImporter
 
             status = "Checking local files and importing changes...";
             ReportProgress(ScanProgressEnd, "Checking local files...", true);
+            var timer = System.Diagnostics.Stopwatch.StartNew();
             await ImportChangedFolders(effectiveSettings);
             ReportProgress(0.99f, "Importing assets into Unity...", true);
             AssetDatabase.Refresh();
+            importSeconds = timer.Elapsed.TotalSeconds;
             status = string.Format(
                 "Finished. New: {0}, changed: {1}, existing: {2}, skipped: {3}.",
                 newFileCount,
@@ -517,46 +534,97 @@ namespace GoogleDriveImporter
         {
             using (var client = new GoogleDriveRestClient(effectiveSettings))
             {
-                foreach (var folder in folders)
+                var timer = System.Diagnostics.Stopwatch.StartNew();
+                string account = await client.GetAccountKey();
+                var results = new FolderScanResult[folders.Count];
+                var indices = new List<int>();
+                for (int i = 0; i < folders.Count; i++) indices.Add(i);
+                await EditorAsyncRunner.RunInParallel(indices, maxParallelScans, async index =>
                 {
-                    status = "Scanning folder " + folder.Id + "...";
-                    ReportProgress(ScanProgressEnd * folderScans.Count / Math.Max(1, folders.Count),
-                        "Scanning folder " + (folderScans.Count + 1) + "/" + folders.Count + "...", true);
-                    Repaint();
-
-                    FolderScanResult scan = await ScanPresetFolder(client, folder);
-                    folderScans.Add(scan);
+                    FolderClone folder = folders[index];
+                    PresetFolderCache cache = GetPresetFolderCache(folder);
+                    if (!IsCacheForFolder(cache, folder)) cache = null;
+                    var snapshot = await GoogleDriveRemoteSnapshot.Fetch(client, folder.Id, cache,
+                        account, verifyAll, maxParallelScans,
+                        message => ReportProgress(0.1f * (fullScanCount + incrementalScanCount) / Math.Max(1, folders.Count), message));
+                    results[index] = BuildScan(folder, snapshot, cache);
+                    if (snapshot.FullScan) fullScanCount++; else incrementalScanCount++;
+                    ReportProgress(0.1f * (fullScanCount + incrementalScanCount) / Math.Max(1, folders.Count),
+                        "Checked Drive folders: " + (fullScanCount + incrementalScanCount) + "/" + folders.Count);
+                });
+                remoteSeconds = timer.Elapsed.TotalSeconds;
+                // Preserve preset order even when remote requests finish out of order.
+                folderScans.AddRange(results);
+                timer.Restart();
+                int checkedFiles = 0;
+                int totalFiles = 0;
+                foreach (var scan in folderScans) totalFiles += scan.Files.Count;
+                foreach (var scan in folderScans)
+                {
+                    string localRoot = CombineSafePath(ResolveProjectPath(scan.Preset.Path), scan.RootName);
+                    await EditorAsyncRunner.RunInParallel(scan.Files, 4, async file =>
+                    {
+                        string path = CombinePathSegments(localRoot, file.PathSegments);
+                        scan.LocalChecks[file.Id] = await GoogleDriveLocalFileCache.IsUnchangedAsync(file, path, verifyAll);
+                        checkedFiles++;
+                        ReportProgress(0.1f + 0.1f * checkedFiles / Math.Max(1, totalFiles),
+                            (verifyAll ? "Verifying checksums: " : "Checking local files: ") + checkedFiles + "/" + totalFiles);
+                    });
+                    scan.IsChanged = string.IsNullOrEmpty(scan.ImportedFingerprint)
+                        || scan.ImportedFingerprint != scan.FetchedFingerprint;
+                    foreach (bool unchanged in scan.LocalChecks.Values)
+                        if (!unchanged) scan.IsChanged = true;
                     SavePresetFolderCache(scan);
-                    ReportProgress(ScanProgressEnd * folderScans.Count / Math.Max(1, folders.Count),
-                        "Scanned " + folderScans.Count + "/" + folders.Count + " folders", true);
                 }
+                localSeconds = timer.Elapsed.TotalSeconds;
+                if (presetFolderId != null)
+                    AssetDatabase.SaveAssetIfDirty(presetFolderId);
             }
         }
 
-        private async Task<FolderScanResult> ScanPresetFolder(
-            GoogleDriveRestClient client,
-            FolderClone folder)
+        private static FolderScanResult BuildScan(FolderClone folder, GoogleDriveRemoteSnapshot snapshot,
+            PresetFolderCache cache)
         {
-            GoogleDriveFile rootFolder = await client.GetFile(folder.Id);
-            if (rootFolder == null || !rootFolder.IsFolder)
-                throw new InvalidOperationException("The configured Google Drive ID is not a folder: " + folder.Id);
-
-            var scan = new FolderScanResult(folder);
-            scan.RootName = rootFolder.Name;
-            scan.AddFingerprint(rootFolder, new[] { rootFolder.Name });
-            scan.ConsiderModified(rootFolder.ModifiedTime);
-
-            await ScanFolder(client, rootFolder.Id, new List<string>(), scan);
-
+            var scan = new FolderScanResult(folder) { Snapshot = snapshot };
+            var children = new Dictionary<string, List<GoogleDriveFile>>(StringComparer.Ordinal);
+            GoogleDriveFile root = null;
+            foreach (GoogleDriveFile node in snapshot.Nodes)
+            {
+                if (node.Id == folder.Id) { root = node; continue; }
+                foreach (string parent in node.parents ?? Array.Empty<string>())
+                {
+                    if (!children.TryGetValue(parent, out var list))
+                        children[parent] = list = new List<GoogleDriveFile>();
+                    list.Add(node);
+                }
+            }
+            if (root == null) throw new InvalidOperationException("Cached Drive root is missing.");
+            scan.RootName = root.Name;
+            scan.AddFingerprint(root, new[] { root.Name });
+            scan.ConsiderModified(root.ModifiedTime);
+            var visited = new HashSet<string>(StringComparer.Ordinal) { root.Id };
+            var queue = new Queue<KeyValuePair<string, List<string>>>();
+            queue.Enqueue(new KeyValuePair<string, List<string>>(root.Id, new List<string>()));
+            while (queue.Count > 0)
+            {
+                var parent = queue.Dequeue();
+                if (!children.TryGetValue(parent.Key, out var entries)) continue;
+                foreach (GoogleDriveFile file in entries)
+                {
+                    if (!visited.Add(file.Id)) continue;
+                    var path = AppendPathSegment(parent.Value, file.Name);
+                    scan.AddFingerprint(file, path.ToArray());
+                    scan.ConsiderModified(file.ModifiedTime);
+                    if (file.IsFolder)
+                        queue.Enqueue(new KeyValuePair<string, List<string>>(file.Id, path));
+                    else if (!file.IsBinaryFile) scan.SkippedCount++;
+                    else scan.Files.Add(new PresetFolderAssetCache { Id = file.Id, PathSegments = path.ToArray(),
+                        Size = file.Size, Md5Checksum = file.Md5Checksum, ModifiedTime = file.ModifiedTime });
+                }
+            }
             scan.FetchedFingerprint = ComputeFingerprint(scan.FingerprintParts);
-            PresetFolderCache cache = GetPresetFolderCache(folder);
-            if (!IsCacheForFolder(cache, folder))
-                cache = null;
             scan.ImportedFingerprint = cache == null ? string.Empty : cache.ImportedFingerprint;
             ApplyCachedLocalMetadata(scan, cache);
-            scan.IsChanged = string.IsNullOrEmpty(scan.ImportedFingerprint)
-                || !string.Equals(scan.ImportedFingerprint, scan.FetchedFingerprint, StringComparison.Ordinal)
-                || await HasLocalChangesAsync(scan);
             return scan;
         }
 
@@ -570,24 +638,10 @@ namespace GoogleDriveImporter
             foreach (PresetFolderAssetCache file in scan.Files)
             {
                 string filePath = CombinePathSegments(localRoot, file.PathSegments);
-                if (!GoogleDriveLocalFileCache.IsUnchanged(file, filePath))
+                if (!GoogleDriveLocalFileCache.IsMetadataUnchanged(file, filePath))
                     return true;
             }
 
-            return false;
-        }
-
-        private static async Task<bool> HasLocalChangesAsync(FolderScanResult scan)
-        {
-            string localRoot = CombineSafePath(ResolveProjectPath(scan.Preset.Path), scan.RootName);
-            if (!Directory.Exists(localRoot))
-                return true;
-            foreach (PresetFolderAssetCache file in scan.Files)
-            {
-                string path = CombinePathSegments(localRoot, file.PathSegments);
-                if (!await GoogleDriveLocalFileCache.IsUnchangedAsync(file, path))
-                    return true;
-            }
             return false;
         }
 
@@ -612,48 +666,6 @@ namespace GoogleDriveImporter
                 file.LocalLastWriteTimeUtcTicks = cachedFile.LocalLastWriteTimeUtcTicks;
                 file.LocalMd5Checksum = cachedFile.LocalMd5Checksum;
                 file.LocalModifiedTime = cachedFile.LocalModifiedTime;
-            }
-        }
-
-        private async Task ScanFolder(
-            GoogleDriveRestClient client,
-            string folderId,
-            List<string> parentSegments,
-            FolderScanResult scan)
-        {
-            ReportProgress(ScanProgressEnd * folderScans.Count / Math.Max(1, folders.Count),
-                "Scanning " + scan.RootName + ": " + scan.Files.Count + " files found");
-            GoogleDriveFileList fileList = await client.ListFilesInFolder(folderId);
-            GoogleDriveFile[] files = fileList == null || fileList.Files == null
-                ? Array.Empty<GoogleDriveFile>()
-                : fileList.Files;
-
-            foreach (GoogleDriveFile file in files)
-            {
-                List<string> pathSegments = AppendPathSegment(parentSegments, file.Name);
-                scan.AddFingerprint(file, pathSegments.ToArray());
-                scan.ConsiderModified(file.ModifiedTime);
-
-                if (file.IsFolder)
-                {
-                    await ScanFolder(client, file.Id, pathSegments, scan);
-                    continue;
-                }
-
-                if (!file.IsBinaryFile)
-                {
-                    scan.SkippedCount++;
-                    continue;
-                }
-
-                scan.Files.Add(new PresetFolderAssetCache
-                {
-                    Id = file.Id,
-                    PathSegments = pathSegments.ToArray(),
-                    Size = file.Size,
-                    Md5Checksum = file.Md5Checksum,
-                    ModifiedTime = file.ModifiedTime
-                });
             }
         }
 
@@ -737,7 +749,9 @@ namespace GoogleDriveImporter
                 string fileName = file.PathSegments[file.PathSegments.Length - 1];
                 string filePath = CombinePathSegments(localRoot, file.PathSegments);
                 bool existed = File.Exists(filePath);
-                bool isUnchanged = await GoogleDriveLocalFileCache.IsUnchangedAsync(file, filePath);
+                bool isUnchanged;
+                if (!scan.LocalChecks.TryGetValue(file.Id, out isUnchanged))
+                    isUnchanged = await GoogleDriveLocalFileCache.IsUnchangedAsync(file, filePath, verifyAll);
 
                 var work = new ImportFileWork
                 {
@@ -1092,6 +1106,13 @@ namespace GoogleDriveImporter
                 throw new InvalidOperationException(
                     "Could not save the Google Drive cache because its PresetFolder source is missing.");
 
+            if (scan.Snapshot != null)
+            {
+                cache.Nodes = new List<GoogleDriveFile>(scan.Snapshot.Nodes);
+                cache.ChangeToken = scan.Snapshot.Token;
+                cache.ChangeAccount = scan.Snapshot.Account;
+                cache.DriveId = scan.Snapshot.DriveId;
+            }
             cache.FolderId = scan.Preset.Id;
             cache.HeaderPath = scan.Preset.Path ?? string.Empty;
             cache.RootName = scan.RootName;
@@ -1108,7 +1129,6 @@ namespace GoogleDriveImporter
             cache.Files.AddRange(scan.Files);
 
             EditorUtility.SetDirty(presetFolderId);
-            AssetDatabase.SaveAssetIfDirty(presetFolderId);
         }
 
         private void ResetCounters()
@@ -1140,6 +1160,8 @@ namespace GoogleDriveImporter
         private sealed class FolderScanResult
         {
             public readonly FolderClone Preset;
+            public GoogleDriveRemoteSnapshot Snapshot;
+            public readonly Dictionary<string, bool> LocalChecks = new Dictionary<string, bool>(StringComparer.Ordinal);
             public readonly List<PresetFolderAssetCache> Files = new List<PresetFolderAssetCache>();
             public readonly List<string> FingerprintParts = new List<string>();
             public string RootName;

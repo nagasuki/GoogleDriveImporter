@@ -7,6 +7,7 @@ using System.Net.Sockets;
 using System.Security.Cryptography;
 using System.Text;
 using System.Threading.Tasks;
+using System.Threading;
 using UnityEngine;
 using UnityEngine.Networking;
 
@@ -22,6 +23,9 @@ namespace GoogleDriveImporter
         public string createdTime;
         public string modifiedTime;
         public string md5Checksum;
+        public string[] parents;
+        public string driveId;
+        public bool trashed;
 
         public string Id { get { return id; } }
         public string Name { get { return name; } }
@@ -52,6 +56,7 @@ namespace GoogleDriveImporter
     [Serializable]
     public sealed class GoogleDriveFileList
     {
+        public bool incompleteSearch;
         public GoogleDriveFile[] files;
         public string nextPageToken;
 
@@ -59,19 +64,50 @@ namespace GoogleDriveImporter
         public string NextPageToken { get { return nextPageToken; } }
     }
 
+    [Serializable]
+    internal sealed class DriveChange
+    {
+        public string fileId;
+        public string driveId;
+        public string changeType;
+        public bool removed;
+        public GoogleDriveFile file;
+    }
+
+    [Serializable]
+    internal sealed class DriveChangeList
+    {
+        public DriveChange[] changes;
+        public string nextPageToken;
+        public string newStartPageToken;
+    }
+
+    [Serializable]
+    internal sealed class DriveStartToken { public string startPageToken; }
+
+    [Serializable]
+    internal sealed class DriveUser { public string permissionId; }
+
+    [Serializable]
+    internal sealed class DriveAbout { public DriveUser user; }
+
     internal sealed class GoogleDriveRestClient : IDisposable
     {
         private const string FilesEndpoint = "https://www.googleapis.com/drive/v3/files";
         private readonly GoogleDriveEditorSettings settings;
+        private readonly SemaphoreSlim metadataRequests;
+        private readonly Dictionary<string, Task<DriveChangeList>> changeFeeds = new Dictionary<string, Task<DriveChangeList>>();
+        private readonly Dictionary<string, Task<string>> startTokens = new Dictionary<string, Task<string>>();
 
         public GoogleDriveRestClient(GoogleDriveEditorSettings settings)
         {
             this.settings = settings ?? throw new ArgumentNullException(nameof(settings));
+            metadataRequests = new SemaphoreSlim(Math.Max(1, Math.Min(32, settings.MaxParallelScans)));
             if (string.IsNullOrWhiteSpace(settings.ClientId))
                 throw new InvalidOperationException("GoogleDriveEditorSettings.ClientId is empty.");
         }
 
-        public async Task<GoogleDriveFileList> ListFilesInFolder(string folderId)
+        public async Task<GoogleDriveFileList> ListFilesInFolder(string folderId, string driveId = null)
         {
             if (string.IsNullOrWhiteSpace(folderId))
                 throw new ArgumentException("Folder ID is empty.", nameof(folderId));
@@ -85,9 +121,9 @@ namespace GoogleDriveImporter
                 string url = FilesEndpoint
                     + "?q=" + EscapeUrl(query)
                     + "&pageSize=1000"
-                    + "&fields=" + EscapeUrl("nextPageToken,files(id,name,mimeType,size,createdTime,modifiedTime,md5Checksum)")
+                    + "&fields=" + EscapeUrl("incompleteSearch,nextPageToken,files(id,name,mimeType,size,modifiedTime,md5Checksum,parents,driveId,trashed)")
                     + "&spaces=drive"
-                    + "&corpora=allDrives"
+                    + (string.IsNullOrEmpty(driveId) ? "&corpora=user" : "&corpora=drive&driveId=" + EscapeUrl(driveId))
                     + "&includeItemsFromAllDrives=true"
                     + "&supportsAllDrives=true";
 
@@ -95,6 +131,8 @@ namespace GoogleDriveImporter
                     url += "&pageToken=" + EscapeUrl(pageToken);
 
                 GoogleDriveFileList page = await GetJson<GoogleDriveFileList>(url);
+                if (page != null && page.incompleteSearch)
+                    throw new InvalidOperationException("Drive returned an incomplete folder listing. Retry the scan.");
                 if (page != null && page.Files != null)
                     files.AddRange(page.Files);
                 pageToken = page == null ? null : page.NextPageToken;
@@ -111,7 +149,7 @@ namespace GoogleDriveImporter
 
             string url = FilesEndpoint
                 + "/" + EscapeUrl(fileId)
-                + "?fields=" + EscapeUrl("id,name,mimeType,modifiedTime")
+                + "?fields=" + EscapeUrl("id,name,mimeType,size,modifiedTime,md5Checksum,parents,driveId,trashed")
                 + "&supportsAllDrives=true";
 
             return GetJson<GoogleDriveFile>(url);
@@ -176,13 +214,75 @@ namespace GoogleDriveImporter
             }
         }
 
+        public async Task<string> GetAccountKey()
+        {
+            var about = await GetJson<DriveAbout>("https://www.googleapis.com/drive/v3/about?fields=user(permissionId)");
+            if (about.user == null || string.IsNullOrEmpty(about.user.permissionId))
+                throw new InvalidOperationException("Drive did not return the account identity.");
+            return settings.ClientId + "|" + settings.EffectiveScope + "|" + about.user.permissionId;
+        }
+
+        public Task<string> GetStartToken(string driveId)
+        {
+            string key = driveId ?? string.Empty;
+            if (!startTokens.TryGetValue(key, out var task))
+                startTokens[key] = task = FetchStartToken(key);
+            return task;
+        }
+
+        private async Task<string> FetchStartToken(string driveId)
+        {
+            var result = await GetJson<DriveStartToken>("https://www.googleapis.com/drive/v3/changes/startPageToken?supportsAllDrives=true"
+                + (string.IsNullOrEmpty(driveId) ? "" : "&driveId=" + EscapeUrl(driveId)));
+            if (string.IsNullOrEmpty(result.startPageToken))
+                throw new InvalidOperationException("Drive did not return a change token.");
+            return result.startPageToken;
+        }
+
+        public Task<DriveChangeList> GetChanges(string token, string driveId)
+        {
+            string key = (driveId ?? string.Empty) + "|" + token;
+            if (!changeFeeds.TryGetValue(key, out var task))
+                changeFeeds[key] = task = FetchChanges(token, driveId);
+            return task;
+        }
+
+        private async Task<DriveChangeList> FetchChanges(string token, string driveId)
+        {
+            var changes = new List<DriveChange>();
+            while (true)
+            {
+                var page = await GetJson<DriveChangeList>("https://www.googleapis.com/drive/v3/changes?pageSize=1000&spaces=drive"
+                    + "&supportsAllDrives=true&includeItemsFromAllDrives=true&includeRemoved=true&includeCorpusRemovals=true"
+                    + "&pageToken=" + EscapeUrl(token)
+                    + (string.IsNullOrEmpty(driveId) ? "" : "&driveId=" + EscapeUrl(driveId))
+                    + "&fields=" + EscapeUrl("nextPageToken,newStartPageToken,changes(fileId,driveId,changeType,removed,file(id,name,mimeType,size,modifiedTime,md5Checksum,parents,driveId,trashed))"));
+                if (page.changes != null) changes.AddRange(page.changes);
+                if (string.IsNullOrEmpty(page.nextPageToken))
+                {
+                    if (string.IsNullOrEmpty(page.newStartPageToken))
+                        throw new InvalidOperationException("Drive did not return the next change cursor.");
+                    return new DriveChangeList { changes = changes.ToArray(), newStartPageToken = page.newStartPageToken };
+                }
+                token = page.nextPageToken;
+            }
+        }
+
         public void Dispose()
         {
+            metadataRequests.Dispose();
         }
 
         private async Task<T> GetJson<T>(string url)
         {
-            for (int attempt = 0; attempt < 2; attempt++)
+            await metadataRequests.WaitAsync();
+            try { return await GetJsonWithRetry<T>(url); }
+            finally { metadataRequests.Release(); }
+        }
+
+        private async Task<T> GetJsonWithRetry<T>(string url)
+        {
+            for (int attempt = 0; attempt < 6; attempt++)
             {
                 string accessToken = await GoogleDriveAuth.GetValidAccessToken(settings);
 
@@ -193,9 +293,18 @@ namespace GoogleDriveImporter
 
                     if (request.result != UnityWebRequest.Result.Success)
                     {
-                        if (request.responseCode == 401 && attempt == 0)
+                        if (request.responseCode == 401 && attempt < 5)
                         {
                             GoogleDriveAuth.InvalidateAccessToken(settings, accessToken);
+                            continue;
+                        }
+
+                        var body = request.downloadHandler.text ?? string.Empty;
+                        bool throttled = request.responseCode == 429 || request.responseCode >= 500
+                            || (request.responseCode == 403 && (body.Contains("rateLimitExceeded") || body.Contains("userRateLimitExceeded")));
+                        if (throttled && attempt < 5)
+                        {
+                            await Task.Delay((1 << attempt) * 1000 + new System.Random().Next(250));
                             continue;
                         }
 

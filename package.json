@@ -1,6 +1,6 @@
 {
   "name": "com.nagasuki.google-drive-importer",
-  "version": "1.4.0",
+  "version": "1.4.1",
   "displayName": "Google Drive Importer",
   "description": "Editor-only Google Drive asset importer with shared authorization, optional UniTask or Task async workflows, and content-verified parallel downloads.",
   "unity": "6000.0",

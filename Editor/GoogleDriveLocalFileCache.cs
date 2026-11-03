@@ -26,12 +26,27 @@ namespace GoogleDriveImporter
             return CompareAndRecord(file, ReadFile(path, file.Size));
         }
 
-        public static async Task<bool> IsUnchangedAsync(PresetFolderAssetCache file, string path)
+        public static async Task<bool> IsUnchangedAsync(PresetFolderAssetCache file, string path, bool verifyAll = false)
         {
             if (!CanVerify(file))
                 return false;
+            if (!verifyAll && IsMetadataUnchanged(file, path))
+                return true;
             FileSnapshot snapshot = await ReadFileAsync(path, file.Size);
             return CompareAndRecord(file, snapshot);
+        }
+
+        public static bool IsMetadataUnchanged(PresetFolderAssetCache file, string path)
+        {
+            if (!CanVerify(file) || file.LocalLastWriteTimeUtcTicks == 0
+                || string.IsNullOrEmpty(file.LocalMd5Checksum)
+                || file.ModifiedTime != file.LocalModifiedTime
+                || (!string.IsNullOrEmpty(file.Md5Checksum)
+                    && !string.Equals(file.Md5Checksum, file.LocalMd5Checksum, StringComparison.OrdinalIgnoreCase)))
+                return false;
+            var local = new FileInfo(path);
+            return local.Exists && local.Length == file.Size
+                && local.LastWriteTimeUtc.Ticks == file.LocalLastWriteTimeUtcTicks;
         }
 
         private static bool CanVerify(PresetFolderAssetCache file)

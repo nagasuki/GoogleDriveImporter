@@ -1,0 +1,13 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <TargetFramework>net8.0</TargetFramework>
+    <DefineConstants>UNITY_EDITOR</DefineConstants>
+    <NoWarn>$(NoWarn);CS0649</NoWarn>
+  </PropertyGroup>
+  <ItemGroup>
+    <Compile Include="../Editor/*.cs" />
+    <Reference Include="$(UnityManagedPath)/UnityEngine/UnityEngine*.dll" />
+    <Reference Include="$(UnityManagedPath)/UnityEditor.dll" />
+  </ItemGroup>
+</Project>

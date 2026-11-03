@@ -52,13 +52,14 @@ In Unity Package Manager, choose **Add package from git URL** and enter:
 
 ## Current workflow
 
-Click **Fetch & Import** to scan the Drive folders, check local file contents,
+Click **Fetch & Import** to check Drive changes, check local files,
 and immediately import new or changed assets. Matching files are skipped. If
 everything is up to date, the operation completes without downloading anything.
 The button remains available for the next check and is disabled while busy.
 
 One Editor progress bar runs from 0 to 100%, with the current stage and completed
-folder/file counts. Scanning uses 0-20%, local checks use 20-30%, and downloads
+folder/file counts. Remote checks use 0-10%, local checks use 10-20%, import
+preparation uses 20-30%, and downloads
 and checksum verification use 30-95%, weighted by file size. The final stage saves
 the cache and imports assets into Unity. It reaches 100% after the
 whole operation finishes; the tool keeps the final percentage visible. The
@@ -70,20 +71,42 @@ names, Last Update, change status, and scanned file list. The asset stores both
 the latest fetched fingerprint and the last successfully imported fingerprint.
 Commit the `PresetFolderId` asset to version control so teammates can share the
 same fetched snapshot and do not download the same update unnecessarily.
-Each click refreshes the Drive snapshot before importing, so a cached scan never
-causes new Drive changes to be overlooked.
+Each click checks Drive before importing. The first fetch builds a cached folder
+structure and captures a Changes API cursor before listing files. Later fetches
+apply binary-file additions, edits, moves and removals from the change log to that
+snapshot. Unrelated Drive changes do not require another tree scan. Structural
+folder changes rebuild the affected preset root to discover nested contents and
+refresh paths. Shared drives use their own change logs; cursors are bound to the
+account, OAuth client, scope and drive. Unusable cursors trigger a fresh scan.
+If access to a shared drive's change log is unavailable, the importer reports a
+warning and uses full scans instead. Remote removals update the snapshot; they do
+not delete previously imported files from disk.
 
-Fetch & Import also checks the actual bytes of local files against Drive's MD5
-checksums. Missing files, changed bytes (including same-size edits), and changed
-Drive versions mark the folder for import. Matching files are skipped even if
-another file in the same folder changed. Checksums are computed by streaming the
-local bytes, without downloading another copy or retaining a whole image in RAM.
-During Fetch & Import, file reads and hashing run on up to four background workers;
-cache updates and Unity APIs resume on the editor thread.
+**Fetch & Import** uses a fast local check: a previously verified file with the
+same remote version, size and local modification time skips hashing. Files with
+changed metadata are checked against the Drive MD5 (or the recorded checksum
+when Drive supplies none). Downloads are always verified. A same-size local edit
+that preserves the exact modification time can escape this fast check.
+
+Use **Verify All & Import** for a fresh remote tree scan and MD5 verification of
+every local file, including edits that preserve size and modification time.
+Local checks run through up to four workers, and their results are reused during
+import preparation so each file is checked once per operation. Opening the
+window only checks cached local metadata; it does not hash file contents.
+
+Remote metadata requests run in parallel with a global per-operation limit.
+`MaxParallelScans` defaults to 8 and supports 1-32. Metadata requests retry rate
+limits and server errors with bounded exponential backoff and jitter. Matching
+change-feed requests are shared across preset roots within the operation.
+The completion message reports remote, local and import times, plus full versus
+incremental root counts. The first run still needs a baseline scan; subsequent
+unchanged runs should benefit most. Measure with your actual Drive before
+increasing concurrency.
 
 For a binary file without a Drive checksum, the importer records its remote
 modification time and a checksum of the downloaded bytes. It skips that file only
-when the remote version and local bytes still match; size alone is insufficient.
+when the remote version and local verification still match (using metadata in
+fast mode or file contents in Verify All); size alone is insufficient.
 Old cache entries without this information are downloaded once to establish it.
 
 Changed binary files are downloaded in parallel. The default is 8 simultaneous
@@ -145,3 +168,18 @@ reload or editor shutdown, allowing requests and temporary files to be cleaned u
 - https://developers.google.com/workspace/drive/api/reference/rest/v3/files/list
 - https://developers.google.com/workspace/drive/api/guides/manage-downloads
 - https://developers.google.com/identity/protocols/oauth2
+
+## Offline regression checks
+
+The checks compile the editor sources against an installed Unity editor's managed
+assemblies and exercise incremental snapshots, path rebuilding and local file
+verification without launching Unity or contacting Drive. With .NET 8+ installed:
+
+```powershell
+dotnet run --project 'Tests~/Checks.csproj' '-p:UnityManagedPath=C:/Program Files/Unity/Hub/Editor/6000.5.6f1/Editor/Data/Managed'
+```
+
+Adjust `UnityManagedPath` to your installed editor. These checks do not replace a
+live OAuth, Changes API and Editor import smoke test.
+
+Changes API behavior follows the [Google Drive change log documentation](https://developers.google.com/workspace/drive/api/guides/manage-changes).

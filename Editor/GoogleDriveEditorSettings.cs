@@ -24,6 +24,10 @@ namespace GoogleDriveImporter
         [Tooltip("Maximum number of asset files downloaded at the same time. Higher values may trigger network or API throttling.")]
         public int MaxParallelDownloads = DefaultMaxParallelDownloads;
 
+        [Range(1, 32)]
+        [Tooltip("Maximum simultaneous metadata requests, including folder scans.")]
+        public int MaxParallelScans = 8;
+
         [SerializeField, HideInInspector] private string accessToken;
         [SerializeField, HideInInspector] private string refreshToken;
         [SerializeField, HideInInspector] private long accessTokenExpiresAt;

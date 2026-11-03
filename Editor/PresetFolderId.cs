@@ -34,6 +34,11 @@ namespace GoogleDriveImporter
     [Serializable]
     public sealed class PresetFolderCache
     {
+        [HideInInspector] public string ChangeToken;
+        [HideInInspector] public string ChangeAccount;
+        [HideInInspector] public string DriveId;
+        [HideInInspector] public List<GoogleDriveFile> Nodes = new List<GoogleDriveFile>();
+
         [HideInInspector]
         public string FolderId;
 
