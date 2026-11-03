@@ -1,12 +1,12 @@
 #if UNITY_EDITOR
 using System;
-using System.Collections;
 using System.Collections.Generic;
 using System.IO;
 using System.Net;
 using System.Net.Sockets;
 using System.Security.Cryptography;
 using System.Text;
+using System.Threading.Tasks;
 using UnityEngine;
 using UnityEngine.Networking;
 
@@ -71,7 +71,7 @@ namespace GoogleDriveImporter
                 throw new InvalidOperationException("GoogleDriveEditorSettings.ClientId is empty.");
         }
 
-        public IEnumerator ListFilesInFolder(string folderId, Action<GoogleDriveFileList> onDone)
+        public async Task<GoogleDriveFileList> ListFilesInFolder(string folderId)
         {
             if (string.IsNullOrWhiteSpace(folderId))
                 throw new ArgumentException("Folder ID is empty.", nameof(folderId));
@@ -94,18 +94,17 @@ namespace GoogleDriveImporter
                 if (!string.IsNullOrEmpty(pageToken))
                     url += "&pageToken=" + EscapeUrl(pageToken);
 
-                GoogleDriveFileList page = null;
-                yield return GetJson<GoogleDriveFileList>(url, result => page = result);
+                GoogleDriveFileList page = await GetJson<GoogleDriveFileList>(url);
                 if (page != null && page.Files != null)
                     files.AddRange(page.Files);
                 pageToken = page == null ? null : page.NextPageToken;
             }
             while (!string.IsNullOrEmpty(pageToken));
 
-            onDone?.Invoke(new GoogleDriveFileList { files = files.ToArray() });
+            return new GoogleDriveFileList { files = files.ToArray() };
         }
 
-        public IEnumerator GetFile(string fileId, Action<GoogleDriveFile> onDone)
+        public Task<GoogleDriveFile> GetFile(string fileId)
         {
             if (string.IsNullOrWhiteSpace(fileId))
                 throw new ArgumentException("File ID is empty.", nameof(fileId));
@@ -115,12 +114,10 @@ namespace GoogleDriveImporter
                 + "?fields=" + EscapeUrl("id,name,mimeType,modifiedTime")
                 + "&supportsAllDrives=true";
 
-            GoogleDriveFile file = null;
-            yield return GetJson<GoogleDriveFile>(url, result => file = result);
-            onDone?.Invoke(file);
+            return GetJson<GoogleDriveFile>(url);
         }
 
-        public IEnumerator DownloadFileToPath(string fileId, string destinationPath, Action<float> onProgress = null)
+        public async Task DownloadFileToPath(string fileId, string destinationPath, Action<float> onProgress = null)
         {
             if (string.IsNullOrWhiteSpace(fileId))
                 throw new ArgumentException("File ID is empty.", nameof(fileId));
@@ -139,8 +136,7 @@ namespace GoogleDriveImporter
             {
                 for (int attempt = 0; attempt < 2; attempt++)
                 {
-                    string accessToken = null;
-                    yield return GoogleDriveAuth.GetValidAccessToken(settings, token => accessToken = token);
+                    string accessToken = await GoogleDriveAuth.GetValidAccessToken(settings);
 
                     string url = FilesEndpoint + "/" + EscapeUrl(fileId) + "?alt=media&supportsAllDrives=true";
                     using (var request = UnityWebRequest.Get(url))
@@ -149,18 +145,15 @@ namespace GoogleDriveImporter
                         request.SetRequestHeader("Authorization", "Bearer " + accessToken);
 
                         UnityWebRequestAsyncOperation operation = request.SendWebRequest();
-                        while (!operation.isDone)
-                        {
-                            onProgress?.Invoke(request.downloadProgress < 0f ? 0f : request.downloadProgress);
-                            yield return null;
-                        }
+                        await EditorAsyncRunner.WaitForOperation(operation, () =>
+                            onProgress?.Invoke(request.downloadProgress < 0f ? 0f : request.downloadProgress));
 
                         onProgress?.Invoke(1f);
                         if (request.result != UnityWebRequest.Result.Success)
                         {
                             if (request.responseCode == 401 && attempt == 0)
                             {
-                                GoogleDriveAuth.InvalidateAccessToken(settings);
+                                GoogleDriveAuth.InvalidateAccessToken(settings, accessToken);
                                 continue;
                             }
 
@@ -171,7 +164,7 @@ namespace GoogleDriveImporter
                     if (File.Exists(destinationPath))
                         File.Delete(destinationPath);
                     File.Move(temporaryPath, destinationPath);
-                    yield break;
+                    return;
                 }
 
                 throw new InvalidOperationException("Google Drive download failed after refreshing the access token.");
@@ -187,23 +180,22 @@ namespace GoogleDriveImporter
         {
         }
 
-        private IEnumerator GetJson<T>(string url, Action<T> onDone)
+        private async Task<T> GetJson<T>(string url)
         {
             for (int attempt = 0; attempt < 2; attempt++)
             {
-                string accessToken = null;
-                yield return GoogleDriveAuth.GetValidAccessToken(settings, token => accessToken = token);
+                string accessToken = await GoogleDriveAuth.GetValidAccessToken(settings);
 
                 using (var request = UnityWebRequest.Get(url))
                 {
                     request.SetRequestHeader("Authorization", "Bearer " + accessToken);
-                    yield return request.SendWebRequest();
+                    await EditorAsyncRunner.WaitForOperation(request.SendWebRequest());
 
                     if (request.result != UnityWebRequest.Result.Success)
                     {
                         if (request.responseCode == 401 && attempt == 0)
                         {
-                            GoogleDriveAuth.InvalidateAccessToken(settings);
+                            GoogleDriveAuth.InvalidateAccessToken(settings, accessToken);
                             continue;
                         }
 
@@ -214,8 +206,7 @@ namespace GoogleDriveImporter
                     if (result == null)
                         throw new InvalidOperationException("Google Drive returned an empty JSON response.");
 
-                    onDone?.Invoke(result);
-                    yield break;
+                    return result;
                 }
             }
 
@@ -224,7 +215,9 @@ namespace GoogleDriveImporter
 
         private static GoogleDriveRequestException CreateRequestException(UnityWebRequest request)
         {
-            string responseBody = request.downloadHandler == null ? string.Empty : request.downloadHandler.text;
+            string responseBody = request.downloadHandler is DownloadHandlerBuffer
+                ? request.downloadHandler.text
+                : string.Empty;
             return new GoogleDriveRequestException(request.responseCode, request.error, responseBody);
         }
 
@@ -281,27 +274,22 @@ namespace GoogleDriveImporter
             settings.StoreTokens(Read(AccessTokenKey), refreshToken, ReadLong(ExpiryKey));
         }
 
-        public static IEnumerator GetValidAccessToken(GoogleDriveEditorSettings settings, Action<string> onDone)
+        public static async Task<string> GetValidAccessToken(GoogleDriveEditorSettings settings)
         {
             ValidateSettings(settings);
             MigrateStoredTokens(settings);
-            while (Refreshing.Contains(settings))
-                yield return null;
+            if (Refreshing.Contains(settings))
+                await EditorAsyncRunner.WaitUntil(() => !Refreshing.Contains(settings));
 
             string accessToken = settings.AccessToken;
             long expiresAt = settings.AccessTokenExpiresAt;
             if (!string.IsNullOrEmpty(accessToken) && expiresAt > DateTimeOffset.UtcNow.ToUnixTimeSeconds() + 60)
-            {
-                onDone?.Invoke(accessToken);
-                yield break;
-            }
+                return accessToken;
 
             Refreshing.Add(settings);
             try
             {
-                string refreshedToken = null;
-                yield return RefreshAccessToken(settings, token => refreshedToken = token);
-                onDone?.Invoke(refreshedToken);
+                return await RefreshAccessToken(settings);
             }
             finally
             {
@@ -309,7 +297,7 @@ namespace GoogleDriveImporter
             }
         }
 
-        public static IEnumerator Authorize(GoogleDriveEditorSettings settings, Action<string> onStatus)
+        public static async Task Authorize(GoogleDriveEditorSettings settings, Action<string> onStatus)
         {
             ValidateSettings(settings);
             onStatus?.Invoke("Starting local OAuth callback listener...");
@@ -344,12 +332,8 @@ namespace GoogleDriveImporter
                 Application.OpenURL(authorizationUrl);
                 onStatus?.Invoke("Complete authorization in the browser...");
 
-                float timeout = 300f;
-                while (!callback.IsCompleted && timeout > 0f)
-                {
-                    timeout -= 1f / 60f;
-                    yield return null;
-                }
+                DateTimeOffset deadline = DateTimeOffset.UtcNow.AddMinutes(5);
+                await EditorAsyncRunner.WaitUntil(() => callback.IsCompleted || DateTimeOffset.UtcNow >= deadline);
 
                 if (!callback.IsCompleted)
                     throw new TimeoutException("Timed out waiting for the Google OAuth callback.");
@@ -372,7 +356,7 @@ namespace GoogleDriveImporter
                     throw new InvalidOperationException("Google OAuth did not return an authorization code.");
 
                 onStatus?.Invoke("Exchanging authorization code for tokens...");
-                yield return ExchangeCode(settings, code, redirectUri, verifier);
+                await ExchangeCode(settings, code, redirectUri, verifier);
             }
         }
 
@@ -383,12 +367,16 @@ namespace GoogleDriveImporter
             settings.ClearTokens();
         }
 
-        public static void InvalidateAccessToken(GoogleDriveEditorSettings settings)
+        public static void InvalidateAccessToken(GoogleDriveEditorSettings settings, string rejectedToken = null)
         {
+            // Another request may already have refreshed the token after this
+            // request was sent. An old 401 must not invalidate that newer token.
+            if (rejectedToken != null && settings.AccessToken != rejectedToken)
+                return;
             settings.StoreTokens(null, settings.RefreshToken, 0L);
         }
 
-        private static IEnumerator RefreshAccessToken(GoogleDriveEditorSettings settings, Action<string> onDone)
+        private static async Task<string> RefreshAccessToken(GoogleDriveEditorSettings settings)
         {
             ValidateSettings(settings);
             string refreshToken = settings.RefreshToken;
@@ -404,13 +392,12 @@ namespace GoogleDriveImporter
             if (!string.IsNullOrWhiteSpace(settings.ClientSecret))
                 fields.Add("client_secret", settings.ClientSecret);
 
-            GoogleOAuthTokenResponse response = null;
-            yield return SendTokenRequest(fields, result => response = result);
+            GoogleOAuthTokenResponse response = await SendTokenRequest(fields);
             StoreTokenResponse(settings, response, true);
-            onDone?.Invoke(response.access_token);
+            return response.access_token;
         }
 
-        private static IEnumerator ExchangeCode(
+        private static async Task ExchangeCode(
             GoogleDriveEditorSettings settings,
             string code,
             string redirectUri,
@@ -427,12 +414,11 @@ namespace GoogleDriveImporter
             if (!string.IsNullOrWhiteSpace(settings.ClientSecret))
                 fields.Add("client_secret", settings.ClientSecret);
 
-            GoogleOAuthTokenResponse response = null;
-            yield return SendTokenRequest(fields, result => response = result);
+            GoogleOAuthTokenResponse response = await SendTokenRequest(fields);
             StoreTokenResponse(settings, response, false);
         }
 
-        private static IEnumerator SendTokenRequest(Dictionary<string, string> fields, Action<GoogleOAuthTokenResponse> onDone)
+        private static async Task<GoogleOAuthTokenResponse> SendTokenRequest(Dictionary<string, string> fields)
         {
             byte[] bodyBytes = Encoding.UTF8.GetBytes(BuildFormBody(fields));
             using (var request = new UnityWebRequest(TokenEndpoint, UnityWebRequest.kHttpVerbPOST))
@@ -440,7 +426,7 @@ namespace GoogleDriveImporter
                 request.uploadHandler = new UploadHandlerRaw(bodyBytes);
                 request.downloadHandler = new DownloadHandlerBuffer();
                 request.SetRequestHeader("Content-Type", "application/x-www-form-urlencoded");
-                yield return request.SendWebRequest();
+                await EditorAsyncRunner.WaitForOperation(request.SendWebRequest());
 
                 if (request.result != UnityWebRequest.Result.Success)
                 {
@@ -454,7 +440,7 @@ namespace GoogleDriveImporter
                 GoogleOAuthTokenResponse response = TryParseTokenResponse(request.downloadHandler.text);
                 if (response == null || string.IsNullOrEmpty(response.access_token))
                     throw new InvalidOperationException("Google OAuth returned an invalid token response.");
-                onDone?.Invoke(response);
+                return response;
             }
         }
 

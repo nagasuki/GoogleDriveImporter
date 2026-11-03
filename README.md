@@ -4,8 +4,9 @@ Editor-only Google Drive asset importer for Unity.
 
 The package calls the Google Drive REST API directly with Unity's built-in
 `UnityWebRequest`. When UniTask 2.5+ is installed (through UPM or under Assets),
-editor operations automatically use its Update scheduler. Without UniTask, they
-use the built-in editor coroutine runner. No scripting defines or mandatory
+async operations automatically use its awaiters. Without UniTask, they use
+`System.Threading.Tasks.Task` and `async/await`. Downloads, scans and OAuth do
+not use coroutines or `IEnumerator`. No scripting defines or mandatory
 third-party dependencies are required.
 
 ## Setup
@@ -65,15 +66,29 @@ same fetched snapshot and do not download the same update unnecessarily.
 Import uses the latest fetched snapshot; run Fetch Data again when you want to
 check Drive for new changes.
 
-Fetch Data also checks the local destination. If the imported root folder or
-any previously imported binary file is missing, the folder is marked as changed
-so Import Asset can restore it even when the Google Drive fingerprint is
-unchanged.
+Fetch Data also checks the actual bytes of local files against Drive's MD5
+checksums. Missing files, changed bytes (including same-size edits), and changed
+Drive versions mark the folder for import. Matching files are skipped even if
+another file in the same folder changed. Checksums are computed by streaming the
+local bytes, without downloading another copy or retaining a whole image in RAM.
+During Fetch/Import, file reads and hashing run on up to four background workers;
+cache updates and Unity APIs resume on the editor thread.
 
-Changed binary files are downloaded in parallel. The default is 4 simultaneous
+For a binary file without a Drive checksum, the importer records its remote
+modification time and a checksum of the downloaded bytes. It skips that file only
+when the remote version and local bytes still match; size alone is insufficient.
+Old cache entries without this information are downloaded once to establish it.
+
+Changed binary files are downloaded in parallel. The default is 8 simultaneous
 downloads; adjust `MaxParallelDownloads` on the `GoogleDriveEditorSettings`
-asset from 1 to 8 to balance speed against network or Google Drive API
-throttling.
+asset from 1 to 32 to balance speed against network or Google Drive API
+throttling. Existing settings keep their configured value. Larger files start
+first, and finished slots are refilled when the previous operation completes. The importer
+requests one asset refresh after a completed import.
+
+Completed files keep their verified metadata even if another download fails,
+so retrying the import skips those files. A downloaded file must match the
+fetched size/checksum before it is recorded as complete.
 
 The first authorization opens the system browser and receives the OAuth result
 through a temporary localhost callback. Access tokens, refresh tokens, and expiry
@@ -110,9 +125,13 @@ To install UniTask through Package Manager's **Add package from git URL**, use:
 
 `https://github.com/Cysharp/UniTask.git?path=src/UniTask/Assets/Plugins/UniTask#2.5.11`
 
-The optional scheduler uses UniTask's public `WaitUntil` and `Forget` APIs,
-resolved once per domain reload. Parallel download limits and exception handling
-are shared by both schedulers.
+The optional integration uses UniTask's public `WaitUntil`, `ToUniTask` and
+`AsTask` APIs, resolved once per domain reload. The Task fallback awaits
+`AsyncOperation.completed` directly, so a completed request can immediately start
+the next queued file. A bounded worker pool uses `Task.WhenAll` to observe all
+in-flight downloads, including when a request fails. Unity API calls and UI
+callbacks stay on the editor thread. Pending waits are canceled before assembly
+reload or editor shutdown, allowing requests and temporary files to be cleaned up.
 
 ## API references
 

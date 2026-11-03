@@ -8,8 +8,8 @@ namespace GoogleDriveImporter
         menuName = "Google Drive Importer/Editor Settings")]
     public sealed class GoogleDriveEditorSettings : ScriptableObject
     {
-        public const int DefaultMaxParallelDownloads = 4;
-        public const int MaxSupportedParallelDownloads = 8;
+        public const int DefaultMaxParallelDownloads = 8;
+        public const int MaxSupportedParallelDownloads = 32;
 
         [Tooltip("OAuth 2.0 Desktop application client ID from Google Cloud Console.")]
         public string ClientId;
