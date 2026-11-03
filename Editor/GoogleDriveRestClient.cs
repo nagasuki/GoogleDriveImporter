@@ -160,7 +160,7 @@ namespace GoogleDriveImporter
                         {
                             if (request.responseCode == 401 && attempt == 0)
                             {
-                                GoogleDriveAuth.InvalidateAccessToken();
+                                GoogleDriveAuth.InvalidateAccessToken(settings);
                                 continue;
                             }
 
@@ -203,7 +203,7 @@ namespace GoogleDriveImporter
                     {
                         if (request.responseCode == 401 && attempt == 0)
                         {
-                            GoogleDriveAuth.InvalidateAccessToken();
+                            GoogleDriveAuth.InvalidateAccessToken(settings);
                             continue;
                         }
 
@@ -242,58 +242,71 @@ namespace GoogleDriveImporter
         private const string RefreshTokenKey = "GoogleDriveRefreshToken";
         private const string ExpiryKey = "GoogleDriveAccessTokenExpiresAt";
         private const string ClientIdKey = "GoogleDriveOAuthClientId";
-        private const string ClientSecretKey = "GoogleDriveOAuthClientSecret";
         private const string ScopeKey = "GoogleDriveOAuthScope";
+        private static readonly HashSet<GoogleDriveEditorSettings> Refreshing = new HashSet<GoogleDriveEditorSettings>();
 
-        public static bool HasRefreshToken
+        [UnityEditor.InitializeOnLoadMethod]
+        private static void MigrateProjectAuthorization()
         {
-            get { return !string.IsNullOrEmpty(Read(RefreshTokenKey)); }
+            UnityEditor.EditorApplication.delayCall += () =>
+            {
+                string[] settingsGuids = UnityEditor.AssetDatabase.FindAssets("t:GoogleDriveEditorSettings");
+                foreach (string guid in settingsGuids)
+                {
+                    var asset = UnityEditor.AssetDatabase.LoadAssetAtPath<GoogleDriveEditorSettings>(
+                        UnityEditor.AssetDatabase.GUIDToAssetPath(guid));
+                    MigrateStoredTokens(asset);
+                }
+            };
         }
 
-        public static bool HasStoredSettings
+        public static bool HasRefreshToken(GoogleDriveEditorSettings settings)
         {
-            get { return !string.IsNullOrEmpty(ReadEditorPreference(ClientIdKey)); }
+            return settings != null && !string.IsNullOrEmpty(settings.RefreshToken);
         }
 
-        public static void StoreSettings(GoogleDriveEditorSettings settings)
+        public static void MigrateStoredTokens(GoogleDriveEditorSettings settings)
         {
-            if (settings == null || string.IsNullOrWhiteSpace(settings.ClientId))
+            if (settings == null || !settings.CanMigrateLegacyTokens || HasRefreshToken(settings)
+                || !string.Equals(settings.ClientId, ReadEditorPreference(ClientIdKey), StringComparison.Ordinal))
                 return;
 
-            UnityEditor.EditorPrefs.SetString(ClientIdKey, settings.ClientId);
-            UnityEditor.EditorPrefs.SetString(ClientSecretKey, settings.ClientSecret ?? string.Empty);
-            UnityEditor.EditorPrefs.SetString(ScopeKey, settings.Scope ?? string.Empty);
-        }
+            string storedScope = ReadEditorPreference(ScopeKey);
+            if (string.IsNullOrWhiteSpace(storedScope))
+                storedScope = "https://www.googleapis.com/auth/drive.readonly";
+            string refreshToken = Read(RefreshTokenKey);
+            if (settings.EffectiveScope != storedScope || string.IsNullOrEmpty(refreshToken))
+                return;
 
-        public static GoogleDriveEditorSettings CreateStoredSettings()
-        {
-            string clientId = ReadEditorPreference(ClientIdKey);
-            if (string.IsNullOrWhiteSpace(clientId))
-                return null;
-
-            var storedSettings = ScriptableObject.CreateInstance<GoogleDriveEditorSettings>();
-            storedSettings.ClientId = clientId;
-            storedSettings.ClientSecret = ReadEditorPreference(ClientSecretKey);
-            storedSettings.Scope = ReadEditorPreference(ScopeKey);
-            if (string.IsNullOrWhiteSpace(storedSettings.Scope))
-                storedSettings.Scope = "https://www.googleapis.com/auth/drive.readonly";
-            storedSettings.hideFlags = HideFlags.HideAndDontSave;
-            return storedSettings;
+            settings.StoreTokens(Read(AccessTokenKey), refreshToken, ReadLong(ExpiryKey));
         }
 
         public static IEnumerator GetValidAccessToken(GoogleDriveEditorSettings settings, Action<string> onDone)
         {
-            string accessToken = Read(AccessTokenKey);
-            long expiresAt = ReadLong(ExpiryKey);
+            ValidateSettings(settings);
+            MigrateStoredTokens(settings);
+            while (Refreshing.Contains(settings))
+                yield return null;
+
+            string accessToken = settings.AccessToken;
+            long expiresAt = settings.AccessTokenExpiresAt;
             if (!string.IsNullOrEmpty(accessToken) && expiresAt > DateTimeOffset.UtcNow.ToUnixTimeSeconds() + 60)
             {
                 onDone?.Invoke(accessToken);
                 yield break;
             }
 
-            string refreshedToken = null;
-            yield return RefreshAccessToken(settings, token => refreshedToken = token);
-            onDone?.Invoke(refreshedToken);
+            Refreshing.Add(settings);
+            try
+            {
+                string refreshedToken = null;
+                yield return RefreshAccessToken(settings, token => refreshedToken = token);
+                onDone?.Invoke(refreshedToken);
+            }
+            finally
+            {
+                Refreshing.Remove(settings);
+            }
         }
 
         public static IEnumerator Authorize(GoogleDriveEditorSettings settings, Action<string> onStatus)
@@ -316,9 +329,7 @@ namespace GoogleDriveImporter
                     + "?client_id=" + EscapeUrl(settings.ClientId)
                     + "&redirect_uri=" + EscapeUrl(redirectUri)
                     + "&response_type=code"
-                    + "&scope=" + EscapeUrl(string.IsNullOrWhiteSpace(settings.Scope)
-                        ? "https://www.googleapis.com/auth/drive.readonly"
-                        : settings.Scope)
+                    + "&scope=" + EscapeUrl(settings.EffectiveScope)
                     + "&access_type=offline"
                     + "&prompt=consent"
                     + "&code_challenge=" + EscapeUrl(challenge)
@@ -365,25 +376,22 @@ namespace GoogleDriveImporter
             }
         }
 
-        public static void ClearStoredTokens()
+        public static void ClearStoredTokens(GoogleDriveEditorSettings settings)
         {
-            Delete(AccessTokenKey);
-            Delete(RefreshTokenKey);
-            Delete(ExpiryKey);
-            Save();
+            if (settings == null)
+                return;
+            settings.ClearTokens();
         }
 
-        public static void InvalidateAccessToken()
+        public static void InvalidateAccessToken(GoogleDriveEditorSettings settings)
         {
-            Delete(AccessTokenKey);
-            Delete(ExpiryKey);
-            Save();
+            settings.StoreTokens(null, settings.RefreshToken, 0L);
         }
 
         private static IEnumerator RefreshAccessToken(GoogleDriveEditorSettings settings, Action<string> onDone)
         {
             ValidateSettings(settings);
-            string refreshToken = Read(RefreshTokenKey);
+            string refreshToken = settings.RefreshToken;
             if (string.IsNullOrEmpty(refreshToken))
                 throw new InvalidOperationException("No Google refresh token is stored. Authorize Google Drive first.");
 
@@ -398,7 +406,7 @@ namespace GoogleDriveImporter
 
             GoogleOAuthTokenResponse response = null;
             yield return SendTokenRequest(fields, result => response = result);
-            StoreTokenResponse(response, true);
+            StoreTokenResponse(settings, response, true);
             onDone?.Invoke(response.access_token);
         }
 
@@ -421,7 +429,7 @@ namespace GoogleDriveImporter
 
             GoogleOAuthTokenResponse response = null;
             yield return SendTokenRequest(fields, result => response = result);
-            StoreTokenResponse(response, false);
+            StoreTokenResponse(settings, response, false);
         }
 
         private static IEnumerator SendTokenRequest(Dictionary<string, string> fields, Action<GoogleOAuthTokenResponse> onDone)
@@ -450,13 +458,13 @@ namespace GoogleDriveImporter
             }
         }
 
-        private static void StoreTokenResponse(GoogleOAuthTokenResponse response, bool keepExistingRefreshToken)
+        private static void StoreTokenResponse(GoogleDriveEditorSettings settings, GoogleOAuthTokenResponse response, bool keepExistingRefreshToken)
         {
-            Write(AccessTokenKey, response.access_token);
-            if (!keepExistingRefreshToken && !string.IsNullOrEmpty(response.refresh_token))
-                Write(RefreshTokenKey, response.refresh_token);
-            Write(ExpiryKey, (DateTimeOffset.UtcNow.ToUnixTimeSeconds() + Math.Max(response.expires_in, 60)).ToString());
-            Save();
+            string refreshToken = !string.IsNullOrEmpty(response.refresh_token)
+                ? response.refresh_token
+                : keepExistingRefreshToken ? settings.RefreshToken : null;
+            settings.StoreTokens(response.access_token, refreshToken,
+                DateTimeOffset.UtcNow.ToUnixTimeSeconds() + Math.Max(response.expires_in, 0));
         }
 
         private static GoogleOAuthTokenResponse TryParseTokenResponse(string json)
@@ -545,24 +553,6 @@ namespace GoogleDriveImporter
         {
             long value;
             return long.TryParse(Read(key), out value) ? value : 0L;
-        }
-
-        private static void Write(string key, string value)
-        {
-            UnityEditor.EditorPrefs.SetString(key, value ?? string.Empty);
-        }
-
-        private static void Delete(string key)
-        {
-            if (UnityEditor.EditorPrefs.HasKey(key))
-                UnityEditor.EditorPrefs.DeleteKey(key);
-            if (PlayerPrefs.HasKey(key))
-                PlayerPrefs.DeleteKey(key);
-        }
-
-        private static void Save()
-        {
-            PlayerPrefs.Save();
         }
 
         private sealed class OAuthCallbackState

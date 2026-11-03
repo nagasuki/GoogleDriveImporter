@@ -40,7 +40,6 @@ namespace GoogleDriveImporter
         [SerializeField, HideInInspector]
         private GoogleDriveEditorSettings settings;
 
-        private GoogleDriveEditorSettings runtimeSettings;
         private readonly List<FolderClone> folders = new List<FolderClone>();
         private readonly List<FolderScanResult> folderScans = new List<FolderScanResult>();
         private Vector2 scrollPosition;
@@ -48,6 +47,7 @@ namespace GoogleDriveImporter
         private bool hasScan;
         private bool authenticationExpanded;
         private bool wasAuthorized;
+        private bool searchedSettings;
         private string status = "Ready.";
         private int newFileCount;
         private int changedFileCount;
@@ -62,19 +62,11 @@ namespace GoogleDriveImporter
 
         private void InitializeImporter()
         {
+            searchedSettings = false;
             SyncPresetFolders();
             LoadCachedScans();
-            wasAuthorized = GoogleDriveAuth.HasRefreshToken;
+            wasAuthorized = GoogleDriveAuth.HasRefreshToken(GetEffectiveSettings());
             authenticationExpanded = !wasAuthorized || GetEffectiveSettings() == null;
-        }
-
-        private void CleanupImporter()
-        {
-            if (runtimeSettings != null)
-            {
-                DestroyImmediate(runtimeSettings);
-                runtimeSettings = null;
-            }
         }
 
 #if ODIN_INSPECTOR
@@ -82,12 +74,6 @@ namespace GoogleDriveImporter
         {
             base.OnEnable();
             InitializeImporter();
-        }
-
-        protected override void OnDisable()
-        {
-            CleanupImporter();
-            base.OnDisable();
         }
 
         [OnInspectorGUI]
@@ -99,11 +85,6 @@ namespace GoogleDriveImporter
         private void OnEnable()
         {
             InitializeImporter();
-        }
-
-        private void OnDisable()
-        {
-            CleanupImporter();
         }
 
         private void OnGUI()
@@ -127,6 +108,8 @@ namespace GoogleDriveImporter
                 false);
             if (EditorGUI.EndChangeCheck())
             {
+                if (presetFolderId != null && presetFolderId.Settings != null)
+                    settings = presetFolderId.Settings;
                 SyncPresetFolders();
                 LoadCachedScans();
             }
@@ -139,8 +122,8 @@ namespace GoogleDriveImporter
 
         private void DrawAuthenticationControls()
         {
-            bool isAuthorized = GoogleDriveAuth.HasRefreshToken;
             GoogleDriveEditorSettings effectiveSettings = GetEffectiveSettings();
+            bool isAuthorized = GoogleDriveAuth.HasRefreshToken(effectiveSettings);
             if (isAuthorized != wasAuthorized)
             {
                 authenticationExpanded = !isAuthorized || effectiveSettings == null;
@@ -160,21 +143,22 @@ namespace GoogleDriveImporter
                 if (!authenticationExpanded)
                     return;
 
-                if (!isAuthorized || effectiveSettings == null)
+                using (new EditorGUI.DisabledScope(isBusy))
                 {
+                    EditorGUI.BeginChangeCheck();
                     settings = (GoogleDriveEditorSettings)EditorGUILayout.ObjectField(
                         "OAuth settings",
-                        settings,
+                        effectiveSettings,
                         typeof(GoogleDriveEditorSettings),
                         false);
+                    if (EditorGUI.EndChangeCheck())
+                        SavePresetSettings(settings);
                     effectiveSettings = GetEffectiveSettings();
-
-                    if (isAuthorized && settings != null)
-                        GoogleDriveAuth.StoreSettings(settings);
+                    isAuthorized = GoogleDriveAuth.HasRefreshToken(effectiveSettings);
                 }
 
                 EditorGUILayout.LabelField(
-                    isAuthorized ? "Refresh token is stored." : "No refresh token is stored.",
+                    isAuthorized ? "Authorization is saved in the settings asset." : "No refresh token is stored in the settings asset.",
                     EditorStyles.miniLabel);
 
                 using (new EditorGUI.DisabledScope(isBusy || effectiveSettings == null || isAuthorized))
@@ -186,11 +170,11 @@ namespace GoogleDriveImporter
                 if (isAuthorized)
                     EditorGUILayout.HelpBox("Authorized. Clear stored token before authorizing another account.", MessageType.Info);
 
-                using (new EditorGUI.DisabledScope(isBusy || !GoogleDriveAuth.HasRefreshToken))
+                using (new EditorGUI.DisabledScope(isBusy || !isAuthorized))
                 {
                     if (GUILayout.Button("Clear stored token"))
                     {
-                        GoogleDriveAuth.ClearStoredTokens();
+                        GoogleDriveAuth.ClearStoredTokens(effectiveSettings);
                         authenticationExpanded = true;
                         wasAuthorized = false;
                         status = "Stored token cleared.";
@@ -280,7 +264,7 @@ namespace GoogleDriveImporter
                 isBusy
                 || presetFolderId == null
                 || folders.Count == 0
-                || !GoogleDriveAuth.HasRefreshToken
+                || !GoogleDriveAuth.HasRefreshToken(GetEffectiveSettings())
                 || GetEffectiveSettings() == null))
             {
                 if (GUILayout.Button("Fetch Data", GUILayout.MinHeight(28f)))
@@ -379,13 +363,33 @@ namespace GoogleDriveImporter
 
         private GoogleDriveEditorSettings GetEffectiveSettings()
         {
+            if (presetFolderId != null && presetFolderId.Settings != null)
+                settings = presetFolderId.Settings;
+
+            if (settings == null && !searchedSettings)
+            {
+                searchedSettings = true;
+                string[] candidates = AssetDatabase.FindAssets("t:GoogleDriveEditorSettings");
+                if (candidates.Length == 1)
+                    settings = AssetDatabase.LoadAssetAtPath<GoogleDriveEditorSettings>(AssetDatabase.GUIDToAssetPath(candidates[0]));
+            }
+
             if (settings != null)
-                return settings;
+            {
+                GoogleDriveAuth.MigrateStoredTokens(settings);
+                if (presetFolderId != null && presetFolderId.Settings == null)
+                    SavePresetSettings(settings);
+            }
+            return settings;
+        }
 
-            if (runtimeSettings == null)
-                runtimeSettings = GoogleDriveAuth.CreateStoredSettings();
-
-            return runtimeSettings;
+        private void SavePresetSettings(GoogleDriveEditorSettings value)
+        {
+            if (presetFolderId == null || presetFolderId.Settings == value)
+                return;
+            presetFolderId.Settings = value;
+            EditorUtility.SetDirty(presetFolderId);
+            AssetDatabase.SaveAssetIfDirty(presetFolderId);
         }
 
         private void StartAuthorization()
@@ -399,7 +403,6 @@ namespace GoogleDriveImporter
                 return;
             }
 
-            GoogleDriveAuth.StoreSettings(effectiveSettings);
             isBusy = true;
             status = "Opening browser for Google authorization...";
             EditorCoroutineRunner.Start(

@@ -3,8 +3,10 @@
 Editor-only Google Drive asset importer for Unity.
 
 The package calls the Google Drive REST API directly with Unity's built-in
-`UnityWebRequest` and runs all editor work through `IEnumerator`. It does not
-depend on `UnityGoogleDrive`, UniTask or other third-party packages.
+`UnityWebRequest`. When UniTask 2.5+ is installed (through UPM or under Assets),
+editor operations automatically use its Update scheduler. Without UniTask, they
+use the built-in editor coroutine runner. No scripting defines or mandatory
+third-party dependencies are required.
 
 ## Setup
 
@@ -24,7 +26,9 @@ depend on `UnityGoogleDrive`, UniTask or other third-party packages.
      beginning with `Assets/` or an absolute path overrides the group path.
    - The Drive folder's own name is created below its resolved destination path.
 6. Open `Tools > GoogleDrive Importer`, assign both
-   assets, then click **Authorize Google Drive**.
+   assets, then click **Authorize Google Drive**. The settings reference is saved
+   on the folder preset. Commit both assets and their `.meta` files to share the
+   authorization with your team.
 
 Existing assets using the flat `PresetFolders` list remain supported. New
 folder mappings can be added under `Groups` to keep related destinations
@@ -72,10 +76,21 @@ asset from 1 to 8 to balance speed against network or Google Drive API
 throttling.
 
 The first authorization opens the system browser and receives the OAuth result
-through a temporary localhost callback. Tokens are stored in Unity EditorPrefs;
-the OAuth client settings are remembered there as well, so the settings field
-can remain hidden after authorization. Legacy `PlayerPrefs` token keys are
-also read for migration compatibility.
+through a temporary localhost callback. Access tokens, refresh tokens, and expiry
+are serialized into the `GoogleDriveEditorSettings` asset and saved immediately
+after authorization or refresh. A teammate using the shared preset/settings can
+fetch and import immediately; expired access tokens refresh automatically using
+the shared refresh token. All users of that asset access Drive as the authorized
+Google account, so share it only with teammates who should have that access.
+
+Existing EditorPrefs (or legacy PlayerPrefs) tokens migrate automatically after
+scripts reload, or when opening the importer, into a settings asset with the same
+cached client ID and scope.
+Migration leaves the old local entries available to other projects. Each asset
+records that migration or authorization has occurred, so clearing it never
+restores an old local token. If there is only one settings asset in the project,
+the importer selects it automatically; otherwise
+assign it under **Authentication** or on the folder preset.
 
 The importer lists recursively, follows pagination, supports My Drive and
 Shared Drive items, uses the Google Drive folder/file names as-is, downloads
@@ -86,10 +101,18 @@ so additions, removals, renames, and nested file changes are detected even if
 the root folder's own `modifiedTime` did not change. Local files are not
 deleted automatically when a remote file is removed.
 
-If an existing authorized setup was created before OAuth settings were cached,
-expand **Authentication** and assign the `GoogleDriveEditorSettings` asset once.
-After that, the settings field can remain hidden while the stored authorization
-is used normally.
+**Clear stored token** removes authorization from the assigned settings asset.
+Changing its client ID or scope requires authorization again. If an older local
+setup has no cached client ID, authorize the settings asset once to establish
+the shared authorization.
+
+To install UniTask through Package Manager's **Add package from git URL**, use:
+
+`https://github.com/Cysharp/UniTask.git?path=src/UniTask/Assets/Plugins/UniTask#2.5.11`
+
+The optional scheduler uses UniTask's public `WaitUntil` and `Forget` APIs,
+resolved once per domain reload. Parallel download limits and exception handling
+are shared by both schedulers.
 
 ## API references
 

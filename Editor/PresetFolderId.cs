@@ -86,6 +86,9 @@ namespace GoogleDriveImporter
         menuName = "Google Drive Importer/Folder Preset")]
     public sealed class PresetFolderId : ScriptableObject
     {
+        [Tooltip("Shared OAuth settings and authorization. Assign an authorized settings asset so teammates can use this preset immediately.")]
+        public GoogleDriveEditorSettings Settings;
+
         [Tooltip("Folder groups. A group's Drive ID is imported under its Path. Child folders can use their own IDs and destination paths.")]
         public List<PresetFolderGroup> Groups = new List<PresetFolderGroup>();
 

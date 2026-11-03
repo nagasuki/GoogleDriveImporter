@@ -2,6 +2,8 @@
 using System;
 using System.Collections;
 using System.Collections.Generic;
+using System.Reflection;
+using System.Threading;
 using UnityEditor;
 using UnityEngine;
 
@@ -18,6 +20,7 @@ namespace GoogleDriveImporter
         }
 
         private static readonly List<State> Running = new List<State>();
+        private static readonly Action<Func<bool>, Action<Exception>> StartUniTask = CreateUniTaskStarter();
         private static bool isInitialized;
 
         public static void Start(IEnumerator routine, Action completed = null, Action<Exception> failed = null)
@@ -25,14 +28,80 @@ namespace GoogleDriveImporter
             if (routine == null)
                 throw new ArgumentNullException(nameof(routine));
 
-            Initialize();
             var state = new State
             {
                 Completed = completed,
                 Failed = failed
             };
             state.Stack.Push(routine);
+            if (StartUniTask != null)
+            {
+                try
+                {
+                    StartUniTask(() => AdvanceWithUniTask(state), failed ?? Debug.LogException);
+                }
+                catch (TargetInvocationException exception)
+                {
+                    DisposeStack(state.Stack);
+                    Exception cause = exception.InnerException ?? exception;
+                    if (failed == null)
+                        Debug.LogException(cause);
+                    else
+                        failed(cause);
+                }
+                return;
+            }
+
+            Initialize();
             Running.Add(state);
+        }
+
+        private static Action<Func<bool>, Action<Exception>> CreateUniTaskStarter()
+        {
+            // Discover once per domain reload. This works for both UPM and Assets
+            // installations without assembly references or project-wide defines.
+            foreach (Assembly assembly in AppDomain.CurrentDomain.GetAssemblies())
+            {
+                Type taskType = assembly.GetType("Cysharp.Threading.Tasks.UniTask");
+                if (taskType == null)
+                    continue;
+
+                Type timingType = assembly.GetType("Cysharp.Threading.Tasks.PlayerLoopTiming");
+                Type taskExtensions = assembly.GetType("Cysharp.Threading.Tasks.UniTaskExtensions");
+                if (timingType == null || taskExtensions == null)
+                    break;
+
+                MethodInfo waitUntil = taskType.GetMethod("WaitUntil",
+                    new[] { typeof(Func<bool>), timingType, typeof(CancellationToken), typeof(bool) });
+                MethodInfo forget = taskExtensions.GetMethod("Forget",
+                    new[] { taskType, typeof(Action<Exception>), typeof(bool) });
+                if (waitUntil == null || forget == null)
+                    break;
+
+                object timing = Enum.Parse(timingType, "Update");
+                return (isCompleted, failed) =>
+                {
+                    object task = waitUntil.Invoke(null, new[] { isCompleted, timing, CancellationToken.None, (object)false });
+                    forget.Invoke(null, new[] { task, failed, (object)false });
+                };
+            }
+            return null;
+        }
+
+        private static bool AdvanceWithUniTask(State state)
+        {
+            try
+            {
+                if (Advance(state))
+                    return false;
+                state.Completed?.Invoke();
+                return true;
+            }
+            catch
+            {
+                DisposeStack(state.Stack);
+                throw;
+            }
         }
 
         public static IEnumerator RunInParallel(IList<IEnumerator> routines, int maxConcurrent)
@@ -74,8 +143,14 @@ namespace GoogleDriveImporter
                     continue;
 
                 Running.RemoveAt(index);
+                DisposeStack(state.Stack);
                 if (failure != null)
-                    state.Failed?.Invoke(failure);
+                {
+                    if (state.Failed == null)
+                        Debug.LogException(failure);
+                    else
+                        state.Failed(failure);
+                }
                 else
                     state.Completed?.Invoke();
             }
@@ -104,7 +179,7 @@ namespace GoogleDriveImporter
                 IEnumerator current = state.Stack.Peek();
                 if (!current.MoveNext())
                 {
-                    state.Stack.Pop();
+                    (state.Stack.Pop() as IDisposable)?.Dispose();
                     continue;
                 }
 
@@ -136,16 +211,16 @@ namespace GoogleDriveImporter
             return true;
         }
 
-        private sealed class ParallelRoutine : IEnumerator
+        private static void DisposeStack(Stack<IEnumerator> stack)
         {
-            private sealed class ChildState
-            {
-                public readonly Stack<IEnumerator> Stack = new Stack<IEnumerator>();
-                public object CurrentYield;
-            }
+            while (stack.Count > 0)
+                (stack.Pop() as IDisposable)?.Dispose();
+        }
 
+        private sealed class ParallelRoutine : IEnumerator, IDisposable
+        {
             private readonly IList<IEnumerator> routines;
-            private readonly List<ChildState> children = new List<ChildState>();
+            private readonly List<State> children = new List<State>();
             private readonly int maxConcurrent;
             private int nextRoutineIndex;
             private Exception failure;
@@ -172,7 +247,7 @@ namespace GoogleDriveImporter
             {
                 for (int index = children.Count - 1; index >= 0; index--)
                 {
-                    ChildState child = children[index];
+                    State child = children[index];
                     try
                     {
                         if (Advance(child))
@@ -182,6 +257,7 @@ namespace GoogleDriveImporter
                     }
                     catch (Exception exception)
                     {
+                        DisposeStack(child.Stack);
                         children.RemoveAt(index);
                         if (failure == null)
                             failure = exception;
@@ -205,56 +281,26 @@ namespace GoogleDriveImporter
                 throw new NotSupportedException();
             }
 
+            public void Dispose()
+            {
+                foreach (State child in children)
+                    DisposeStack(child.Stack);
+                children.Clear();
+            }
+
             private void StartNextRoutines()
             {
                 while (failure == null
                     && nextRoutineIndex < routines.Count
                     && children.Count < maxConcurrent)
                 {
-                    var child = new ChildState();
+                    var child = new State();
                     child.Stack.Push(routines[nextRoutineIndex]);
                     children.Add(child);
                     nextRoutineIndex++;
                 }
             }
 
-            private static bool Advance(ChildState state)
-            {
-                while (true)
-                {
-                    if (state.CurrentYield != null)
-                    {
-                        if (!IsReady(state.CurrentYield))
-                            return true;
-                        state.CurrentYield = null;
-                    }
-
-                    if (state.Stack.Count == 0)
-                        return false;
-
-                    IEnumerator current = state.Stack.Peek();
-                    if (!current.MoveNext())
-                    {
-                        state.Stack.Pop();
-                        continue;
-                    }
-
-                    object yielded = current.Current;
-                    if (yielded is IEnumerator nested)
-                    {
-                        state.Stack.Push(nested);
-                        continue;
-                    }
-
-                    if (yielded == null)
-                        return true;
-
-                    if (!IsReady(yielded))
-                        state.CurrentYield = yielded;
-
-                    return true;
-                }
-            }
         }
     }
 }
